@@ -1461,12 +1461,15 @@ if map_data:
                         st.session_state.preferred_start = selected_point
                         st.session_state.preferred_start_geojson = drawing
                         if changed:
-                            # Save on the first marker event. Do NOT force an
-                            # immediate rerun here: st_folium has already
-                            # rerun the script for this interaction, and an
-                            # additional rerun rebuilds the Leaflet map and
-                            # visually removes the freshly placed marker.
+                            # st_folium returns the marker only after this map
+                            # instance has already been constructed. Commit the
+                            # point to session state, then deliberately create a
+                            # NEW Folium component on the rerun. The new map is
+                            # built from preferred_start, so one click is enough
+                            # and the saved green marker remains visible.
                             st.session_state.candidates = None
+                            st.session_state.map_revision += 1
+                            st.rerun()
                     else:
                         st.warning(
                             "Startpunkten måste ligga inom det användbara området."
@@ -1481,10 +1484,10 @@ if map_data:
                     st.session_state.preferred_exit = selected_point
                     st.session_state.preferred_exit_geojson = drawing
                     if changed:
-                        # Same as for the start point: the marker event has
-                        # already reached Python, so another rerun is both
-                        # unnecessary and visually disruptive.
+                        # Commit the exit marker in exactly the same way.
                         st.session_state.candidates = None
+                        st.session_state.map_revision += 1
+                        st.rerun()
 
 
 if st.session_state.drawn_area is not None:
