@@ -20,6 +20,10 @@ st.set_page_config(
 
 CACHE_TTL = 900
 
+# Track geometry preferences
+MAX_TURN_DEG = 90.0
+MIN_LEG_SEPARATION_M = 25.0
+
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -384,6 +388,7 @@ def generate_candidate(
     min_leg=60,
     max_leg=100,
 ):
+    """Generate a non-self-intersecting track with well-spaced legs."""
     if area is None or area.is_empty:
         return None
 
@@ -392,7 +397,6 @@ def generate_candidate(
         return None
 
     points = [start]
-
     leg_lengths = random_segment_lengths(
         target_length,
         num_angles,
@@ -402,23 +406,25 @@ def generate_candidate(
     )
 
     current = start
-    previous_angle = None
+    previous_heading = None
+    accepted_segments = []
 
     for leg_length in leg_lengths:
         accepted = False
 
-        for _ in range(60):
-            angle = float(rng.uniform(0, 360))
+        for _ in range(120):
+            if previous_heading is None:
+                heading = float(rng.uniform(0.0, 360.0))
+            else:
+                # Prefer distinct angles while limiting the change in heading
+                # to 90 degrees. Thus no generated turn is sharper than a
+                # right-angle turn.
+                turn = float(rng.uniform(35.0, MAX_TURN_DEG))
+                if rng.random() < 0.5:
+                    turn = -turn
+                heading = (previous_heading + turn) % 360.0
 
-            if previous_angle is not None:
-                delta = abs(
-                    (angle - previous_angle + 180) % 360 - 180
-                )
-                if delta < 25:
-                    continue
-
-            angle_rad = math.radians(angle)
-
+            angle_rad = math.radians(heading)
             candidate_point = Point(
                 current.x + leg_length * math.cos(angle_rad),
                 current.y + leg_length * math.sin(angle_rad),
@@ -429,28 +435,46 @@ def generate_candidate(
                 (candidate_point.x, candidate_point.y),
             ])
 
-            if not segment_allowed(
-                segment, area, hard_geometry
+            if not segment_allowed(segment, area, hard_geometry):
+                continue
+
+            # Ignore the immediately preceding leg because the two legs must
+            # meet at their common angle point.
+            non_adjacent_segments = accepted_segments[:-1]
+
+            # Never allow the track to cross or touch an earlier,
+            # non-adjacent leg.
+            if any(segment.intersects(old) for old in non_adjacent_segments):
+                continue
+
+            # Prefer at least 25 m between non-adjacent legs.
+            if any(
+                segment.distance(old) < MIN_LEG_SEPARATION_M
+                for old in non_adjacent_segments
             ):
                 continue
 
             points.append(candidate_point)
+            accepted_segments.append(segment)
             current = candidate_point
-            previous_angle = angle
+            previous_heading = heading
             accepted = True
             break
 
         if not accepted:
             return None
 
-    track = LineString([
-        (point.x, point.y) for point in points
-    ])
+    track = LineString([(point.x, point.y) for point in points])
 
     if not area.covers(track):
         return None
 
-    if hard_geometry is not None and track.intersects(hard_geometry):
+    if hard_geometry is not None and not hard_geometry.is_empty:
+        if track.intersects(hard_geometry):
+            return None
+
+    # Final safeguard against all forms of LineString self-intersection.
+    if not track.is_simple:
         return None
 
     return {
@@ -491,7 +515,7 @@ def generate_best(
     num_angles,
     num_objects,
     seed,
-    n_candidates=100,
+    n_candidates=250,
     min_leg=60,
     max_leg=100,
 ):
@@ -1078,7 +1102,7 @@ if (
                 num_angles=int(num_angles),
                 num_objects=int(num_objects),
                 seed=int(seed),
-                n_candidates=100,
+                n_candidates=250,
                 min_leg=int(min_leg),
                 max_leg=int(max_leg),
             )
