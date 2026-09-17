@@ -45,23 +45,17 @@ class RuleProfile:
 
 
 RULE_PROFILES = {
-    "2023-2026 / lägre": RuleProfile(
-        "2023-2026 / lägre", 1000, 5, 8, 100, 100, 10
+    "Appell": RuleProfile(
+        "Appell", 600, 4, 3, 60, 100, 10
     ),
-    "2023-2026 / högre": RuleProfile(
-        "2023-2026 / högre", 1200, 6, 8, 100, 100, 10
+    "Lägre": RuleProfile(
+        "Lägre", 1000, 5, 8, 100, 100, 10
     ),
-    "2023-2026 / elit": RuleProfile(
-        "2023-2026 / elit", 1500, 7, 8, 100, 100, 10
+    "Högre": RuleProfile(
+        "Högre", 1200, 6, 8, 100, 100, 10
     ),
-    "2027 / lägre": RuleProfile(
-        "2027 / lägre", 1000, 5, 8, 60, 100, 10
-    ),
-    "2027 / högre": RuleProfile(
-        "2027 / högre", 1200, 6, 8, 60, 100, 10
-    ),
-    "2027 / elit": RuleProfile(
-        "2027 / elit", 1500, 7, 8, 60, 100, 10
+    "Elit": RuleProfile(
+        "Elit", 1500, 7, 8, 100, 100, 10
     ),
 }
 
@@ -75,6 +69,7 @@ for key, value in {
     "preferred_start_geojson": None,
     "preferred_exit": None,
     "preferred_exit_geojson": None,
+    "map_revision": 0,
     "osm_layers": None,
     "osm_area_key": None,
     "osm_count": 0,
@@ -158,6 +153,23 @@ def folium_polygon_to_shapely(coords, to_xy):
 
     return None
 
+
+
+def polygon_leaflet_bounds(area, to_ll):
+    """Return geographic bounds suitable for Folium fit_bounds()."""
+    if area is None or area.is_empty:
+        return None
+
+    minx, miny, maxx, maxy = area.bounds
+    corners = [
+        xy_ll(minx, miny, to_ll),
+        xy_ll(minx, maxy, to_ll),
+        xy_ll(maxx, miny, to_ll),
+        xy_ll(maxx, maxy, to_ll),
+    ]
+    lats = [p[0] for p in corners]
+    lons = [p[1] for p in corners]
+    return [[min(lats), min(lons)], [max(lats), max(lons)]]
 
 def sample_point_in_area(area, rng, max_attempts=2000):
     """Return a random point inside the selected Shapely area."""
@@ -818,29 +830,102 @@ def select_diverse_candidates(
 
 def choose_objects(candidate, num_objects, rng):
     """
-    Place objects along the track.
+    Place objects as evenly as possible along the track.
 
-    The final object is always placed exactly at the end of the track.
-    Earlier objects are distributed between 10% and before the endpoint.
+    Rules:
+    - The final object is always exactly at the end of the track.
+    - Other objects must be at least 10 m from every angle.
+    - Among valid positions, choose a distribution that is as even as
+      possible along the complete track.
     """
     track = candidate["geometry"]
 
     if track.length <= 0 or num_objects <= 0:
         return []
 
+    # One requested object means the mandatory end object only.
     if num_objects == 1:
-        distances = np.array([track.length])
+        distances = [float(track.length)]
     else:
-        # Keep the earlier objects distributed along the track, while
-        # reserving the exact endpoint for the final object.
-        earlier_distances = np.linspace(
-            track.length * 0.10,
-            track.length * 0.85,
-            num_objects - 1,
-        )
-        distances = np.concatenate(
-            [earlier_distances, np.array([track.length])]
-        )
+        # Distances of all internal vertices ("angles") measured along track.
+        coords = list(track.coords)
+        angle_distances = []
+        cumulative = 0.0
+
+        for i in range(1, len(coords)):
+            x0, y0 = coords[i - 1]
+            x1, y1 = coords[i]
+            cumulative += math.hypot(x1 - x0, y1 - y0)
+
+            # Exclude the final endpoint: the mandatory last object is
+            # explicitly allowed there.
+            if i < len(coords) - 1:
+                angle_distances.append(cumulative)
+
+        n_regular = num_objects - 1
+
+        # Start from perfectly even target positions. Include the endpoint in
+        # the conceptual spacing, but reserve it for the mandatory last object.
+        ideal_targets = np.linspace(
+            0.0,
+            float(track.length),
+            num_objects + 1,
+        )[1:-1]
+
+        # Fine one-metre candidate grid. Positions within 10 m of any angle
+        # are excluded. Also reserve the final 10 m for the end object so a
+        # regular object cannot crowd it.
+        max_regular_distance = max(float(track.length) - 10.0, 0.0)
+        grid = np.arange(0.0, max_regular_distance + 0.5, 1.0)
+
+        valid = [
+            float(d)
+            for d in grid
+            if d > 0.0
+            and all(abs(d - a) >= 10.0 for a in angle_distances)
+        ]
+
+        selected = []
+
+        # Assign each ideal target to the nearest still-usable point. Keep
+        # ordering and a modest separation between objects.
+        previous = -float("inf")
+        for target in ideal_targets[:n_regular]:
+            candidates = [
+                d for d in valid
+                if d > previous + 1.0
+            ]
+
+            if not candidates:
+                break
+
+            best = min(candidates, key=lambda d: abs(d - float(target)))
+            selected.append(best)
+            previous = best
+
+        # If the greedy pass could not place every object, fill remaining
+        # slots using valid points that maximize distance from already chosen
+        # objects. This favors an even distribution rather than clustering.
+        while len(selected) < n_regular:
+            remaining = [
+                d for d in valid
+                if all(abs(d - s) > 1.0 for s in selected)
+            ]
+            if not remaining:
+                break
+
+            anchors = [0.0] + selected + [float(track.length)]
+            best = max(
+                remaining,
+                key=lambda d: min(abs(d - a) for a in anchors),
+            )
+            selected.append(best)
+            selected.sort()
+
+        # In very short/constrained tracks it may be geometrically impossible
+        # to place every requested non-end object while respecting the 10 m
+        # angle rule. Never violate the angle rule just to reach the count.
+        distances = selected[:n_regular] + [float(track.length)]
 
     return [
         {
@@ -1040,6 +1125,7 @@ with st.expander("📍 Plats", expanded=True):
                 st.session_state.osm_layers = None
                 st.session_state.osm_area_key = None
                 st.session_state.candidates = None
+                st.session_state.map_revision += 1
                 st.rerun()
 
     with col2:
@@ -1203,6 +1289,16 @@ m = folium.Map(
     control_scale=True,
 )
 
+# Once an area has been selected, it becomes the map's primary focus.
+# The original position remains available as a reference marker, but no longer
+# determines the viewport.
+if st.session_state.drawn_area is not None:
+    selected_bounds = polygon_leaflet_bounds(
+        st.session_state.drawn_area, to_ll
+    )
+    if selected_bounds is not None:
+        m.fit_bounds(selected_bounds, padding=(25, 25))
+
 folium.Marker(
     [lat, lon],
     tooltip="Vald position",
@@ -1268,6 +1364,7 @@ map_data = st_folium(
     width=None,
     height=520,
     returned_objects=["all_drawings"],
+    key=f"track_area_map_{st.session_state.map_revision}",
 )
 
 
@@ -1332,6 +1429,7 @@ if map_data:
                         st.session_state.preferred_start_geojson = drawing
                         if changed:
                             st.session_state.candidates = None
+                            st.rerun()
                     else:
                         st.warning(
                             "Startpunkten måste ligga inom det användbara området."
@@ -1347,6 +1445,7 @@ if map_data:
                     st.session_state.preferred_exit_geojson = drawing
                     if changed:
                         st.session_state.candidates = None
+                        st.rerun()
 
 
 if st.session_state.drawn_area is not None:
@@ -1402,6 +1501,7 @@ if st.session_state.drawn_area is not None:
         st.session_state.osm_layers = None
         st.session_state.osm_area_key = None
         st.session_state.candidates = None
+        st.session_state.map_revision += 1
         st.rerun()
 else:
     st.info(
@@ -1582,6 +1682,12 @@ if st.session_state.candidates:
         zoom_start=15,
         control_scale=True,
     )
+
+    selected_bounds = polygon_leaflet_bounds(
+        st.session_state.drawn_area, to_ll
+    )
+    if selected_bounds is not None:
+        track_map.fit_bounds(selected_bounds, padding=(25, 25))
 
     if st.session_state.drawn_area_geojson:
         folium.GeoJson(
