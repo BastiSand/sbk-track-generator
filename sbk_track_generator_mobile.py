@@ -1184,126 +1184,6 @@ with st.expander("📍 Plats", expanded=True):
         st.success(f"Position: {lat:.6f}, {lon:.6f}")
 
 
-with st.expander("⚙️ Spårinställningar", expanded=True):
-    basic_tab, advanced_tab = st.tabs(["Grundinställningar", "Advanced"])
-
-    with basic_tab:
-        profile_name = st.selectbox(
-            "Regelprofil",
-            list(RULE_PROFILES.keys()),
-        )
-        profile = RULE_PROFILES[profile_name]
-
-        target_length = st.number_input(
-            "Spårlängd (m)",
-            min_value=100,
-            max_value=5000,
-            value=profile.target_length,
-            step=100,
-        )
-
-        num_angles = st.number_input(
-            "Antal vinklar",
-            min_value=1,
-            max_value=20,
-            value=profile.angles,
-            step=1,
-        )
-
-        num_objects = st.number_input(
-            "Antal objekt",
-            min_value=0,
-            max_value=20,
-            value=profile.objects,
-            step=1,
-        )
-
-    with advanced_tab:
-        boundary_margin = st.number_input(
-            "Marginal från områdesgräns (m)",
-            min_value=0,
-            max_value=100,
-            value=profile.boundary_margin,
-            step=5,
-        )
-
-        min_leg = st.number_input(
-            "Minsta benlängd (m)",
-            min_value=20,
-            max_value=500,
-            value=profile.min_leg,
-            step=10,
-        )
-
-        max_leg = st.number_input(
-            "Största benlängd (m)",
-            min_value=20,
-            max_value=500,
-            value=profile.max_leg,
-            step=10,
-        )
-
-        preferred_separation = st.number_input(
-            "Önskat avstånd mellan spårben (m)",
-            min_value=10,
-            max_value=100,
-            value=int(DEFAULT_PREFERRED_LEG_SEPARATION_M),
-            step=5,
-            help="Generatorn premierar minst detta avstånd mellan icke angränsande spårben.",
-        )
-
-        minimum_separation = st.number_input(
-            "Minsta tillåtna avstånd mellan spårben (m)",
-            min_value=5,
-            max_value=50,
-            value=int(DEFAULT_MIN_LEG_SEPARATION_M),
-            step=1,
-            help="Absolut gräns. Spårben får aldrig komma närmare än detta.",
-        )
-
-        start_radius = st.number_input(
-            "Tolerans kring vald startpunkt (m)",
-            min_value=0,
-            max_value=100,
-            value=25,
-            step=5,
-            help="Spåret försöker starta nära vald punkt inom denna radie.",
-        )
-
-        exit_clearance = st.number_input(
-            "Önskat fritt avstånd vid utgång (m)",
-            min_value=10,
-            max_value=100,
-            value=int(DEFAULT_EXIT_CLEARANCE_M),
-            step=5,
-            help=(
-                "Generatorn premierar en utgångsväg som håller minst detta "
-                "avstånd till tidigare spårben."
-            ),
-        )
-
-        start_clearance = st.number_input(
-            "Fri zon runt start efter inledningen (m)",
-            min_value=20,
-            max_value=100,
-            value=int(DEFAULT_START_CLEARANCE_M),
-            step=5,
-            help=(
-                "Efter de två första spårbenen får senare ben inte återvända "
-                "in i denna zon runt starten. Motverkar att spåret ringlar "
-                "runt och stänger in startområdet."
-            ),
-        )
-
-        seed = st.number_input(
-            "Slumpfrö",
-            min_value=0,
-            max_value=999999,
-            value=12345,
-            step=1,
-        )
-
-
 if st.session_state.location is None:
     st.info(
         "Ange först en position. Därefter kan du rita "
@@ -1592,6 +1472,126 @@ else:
     st.info(
         "Rita ett polygonområde på kartan med polygonverktyget."
     )
+
+
+with st.expander("⚙️ Spårinställningar", expanded=True):
+    basic_tab, advanced_tab = st.tabs(["Grundinställningar", "Advanced"])
+
+    with basic_tab:
+        profile_name = st.selectbox(
+            "Regelprofil",
+            list(RULE_PROFILES.keys()),
+        )
+        profile = RULE_PROFILES[profile_name]
+
+        target_length = st.number_input(
+            "Spårlängd (m)",
+            min_value=100,
+            max_value=5000,
+            value=profile.target_length,
+            step=100,
+        )
+
+        num_angles = st.number_input(
+            "Antal vinklar",
+            min_value=1,
+            max_value=20,
+            value=profile.angles,
+            step=1,
+        )
+
+        num_objects = st.number_input(
+            "Antal objekt",
+            min_value=0,
+            max_value=20,
+            value=profile.objects,
+            step=1,
+        )
+
+    with advanced_tab:
+        boundary_margin = st.number_input(
+            "Marginal från områdesgräns (m)",
+            min_value=0,
+            max_value=100,
+            value=profile.boundary_margin,
+            step=5,
+        )
+
+        min_leg = st.number_input(
+            "Minsta benlängd (m)",
+            min_value=20,
+            max_value=500,
+            value=profile.min_leg,
+            step=10,
+        )
+
+        max_leg = st.number_input(
+            "Största benlängd (m)",
+            min_value=20,
+            max_value=500,
+            value=profile.max_leg,
+            step=10,
+        )
+
+        preferred_separation = st.number_input(
+            "Önskat avstånd mellan spårben (m)",
+            min_value=10,
+            max_value=100,
+            value=int(DEFAULT_PREFERRED_LEG_SEPARATION_M),
+            step=5,
+            help="Generatorn premierar minst detta avstånd mellan icke angränsande spårben.",
+        )
+
+        minimum_separation = st.number_input(
+            "Minsta tillåtna avstånd mellan spårben (m)",
+            min_value=5,
+            max_value=50,
+            value=int(DEFAULT_MIN_LEG_SEPARATION_M),
+            step=1,
+            help="Absolut gräns. Spårben får aldrig komma närmare än detta.",
+        )
+
+        start_radius = st.number_input(
+            "Tolerans kring vald startpunkt (m)",
+            min_value=0,
+            max_value=100,
+            value=25,
+            step=5,
+            help="Spåret försöker starta nära vald punkt inom denna radie.",
+        )
+
+        exit_clearance = st.number_input(
+            "Önskat fritt avstånd vid utgång (m)",
+            min_value=10,
+            max_value=100,
+            value=int(DEFAULT_EXIT_CLEARANCE_M),
+            step=5,
+            help=(
+                "Generatorn premierar en utgångsväg som håller minst detta "
+                "avstånd till tidigare spårben."
+            ),
+        )
+
+        start_clearance = st.number_input(
+            "Fri zon runt start efter inledningen (m)",
+            min_value=20,
+            max_value=100,
+            value=int(DEFAULT_START_CLEARANCE_M),
+            step=5,
+            help=(
+                "Efter de två första spårbenen får senare ben inte återvända "
+                "in i denna zon runt starten. Motverkar att spåret ringlar "
+                "runt och stänger in startområdet."
+            ),
+        )
+
+        seed = st.number_input(
+            "Slumpfrö",
+            min_value=0,
+            max_value=999999,
+            value=12345,
+            step=1,
+        )
 
 
 st.divider()
