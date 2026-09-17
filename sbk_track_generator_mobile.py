@@ -1170,6 +1170,14 @@ def add_track_to_map(m, candidate, to_ll, objects=None):
 # ============================================================
 
 st.title("🐕 SBK Spårgenerator")
+
+st.warning(
+    "⚠️ Ansvarsfriskrivning: Detta skript är helt autogenererat av ChatGPT. "
+    "Användaren ansvarar själv för att kontrollera att det genererade spåret "
+    "är korrekt och lämpligt innan spåret påbörjas. Användaren ansvarar även "
+    "för sin egen och hundens säkerhet under användning av spåret."
+)
+
 st.caption(
     "Rita ett valfritt polygonområde och generera spår inom området."
 )
@@ -2039,10 +2047,10 @@ if (
         )
 
 
-with st.expander("📱 Android"):
+with st.expander("📱 "):
     st.write(
         """
-        Appen kan användas i Chrome på Android när den är
+        Appen kan användas i Chrome på  när den är
         publicerad på Streamlit Cloud.
 
         1. Öppna appen i Chrome.
