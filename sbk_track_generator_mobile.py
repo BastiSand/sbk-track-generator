@@ -49,13 +49,13 @@ RULE_PROFILES = {
         "Appell", 300, 2, 3, 60, 100, 10
     ),
     "Lägre": RuleProfile(
-        "Lägre", 1000, 5, 8, 100, 100, 10
+        "Lägre", 1000, 5, 8, 100, 200, 10
     ),
     "Högre": RuleProfile(
-        "Högre", 1200, 6, 8, 100, 100, 10
+        "Högre", 1200, 6, 8, 100, 200, 10
     ),
     "Elit": RuleProfile(
-        "Elit", 1500, 7, 8, 100, 100, 10
+        "Elit", 1500, 7, 8, 100, 200, 10
     ),
 }
 
@@ -405,15 +405,49 @@ def random_segment_lengths(
     min_leg=60,
     max_leg=100,
 ):
-    n_legs = max(2, num_angles + 1)
+    """Generate leg lengths whose sum is target_length and respect bounds."""
+    n_legs = max(2, int(num_angles) + 1)
+    target = float(target_length)
+    low = float(max(1, min_leg))
+    high = float(max(low, max_leg))
 
-    min_leg = max(1, min_leg)
-    max_leg = max(min_leg, max_leg)
+    if target < n_legs * low or target > n_legs * high:
+        return None
 
-    weights = rng.uniform(0.75, 1.25, size=n_legs)
-    lengths = weights / weights.sum() * target_length
-    lengths = np.clip(lengths, min_leg, max_leg)
-    lengths *= target_length / lengths.sum()
+    # Start at the minimum and distribute the remaining length randomly while
+    # never exceeding max_leg. This avoids the old clip-then-rescale behavior,
+    # which could silently violate both bounds.
+    lengths = np.full(n_legs, low, dtype=float)
+    remaining = target - n_legs * low
+    capacities = np.full(n_legs, high - low, dtype=float)
+
+    while remaining > 1e-9:
+        available = np.flatnonzero(capacities > 1e-9)
+        if available.size == 0:
+            return None
+
+        weights = rng.uniform(0.75, 1.25, size=available.size)
+        shares = remaining * weights / weights.sum()
+        added_total = 0.0
+
+        for idx, share in zip(available, shares):
+            add = min(float(share), capacities[idx])
+            lengths[idx] += add
+            capacities[idx] -= add
+            added_total += add
+
+        if added_total <= 1e-12:
+            return None
+        remaining -= added_total
+
+    # Correct tiny floating-point residue on the final leg with capacity.
+    residue = target - float(lengths.sum())
+    if abs(residue) > 1e-9:
+        for idx in range(n_legs - 1, -1, -1):
+            candidate = lengths[idx] + residue
+            if low - 1e-9 <= candidate <= high + 1e-9:
+                lengths[idx] = candidate
+                break
 
     return lengths.tolist()
 
@@ -453,6 +487,8 @@ def generate_candidate(
         target_length, num_angles, rng,
         min_leg=min_leg, max_leg=max_leg,
     )
+    if leg_lengths is None:
+        return None
 
     current = start
     previous_heading = None
@@ -460,11 +496,12 @@ def generate_candidate(
     signed_turns = []
     track_length_so_far = 0.0
     minimum_observed_separation = float("inf")
+    start_zone = start.buffer(float(start_clearance_m))
 
     for leg_length in leg_lengths:
         accepted = False
 
-        for _ in range(160):
+        for _ in range(110):
             proposed_turn = None
             if previous_heading is None:
                 heading = float(rng.uniform(0.0, 360.0))
@@ -567,7 +604,6 @@ def generate_candidate(
             # its own start. This leaves an open access/escape zone instead of
             # wrapping later legs around the starting position.
             if len(accepted_segments) >= 2:
-                start_zone = start.buffer(float(start_clearance_m))
                 if segment.intersects(start_zone):
                     continue
 
@@ -670,6 +706,7 @@ def generate_candidate(
         "start_to_end_distance": float(start_to_end_distance),
         "openness_ratio": float(openness_ratio),
         "length_error_ratio": float(length_error_ratio),
+        "rule_profile": "Appell" if appell_mode else None,
     }
 
 
@@ -855,7 +892,7 @@ def choose_objects(candidate, num_objects, rng):
     #
     # The candidate geometry contains one straight LineString made from the
     # track vertices, so the first two leg lengths can be measured directly.
-    if num_objects == 3 and len(list(track.coords)) == 4 and abs(track.length - 300.0) <= 45.0:
+    if num_objects == 3 and candidate.get("rule_profile") == "Appell":
         coords = list(track.coords)
         if len(coords) >= 4:
             leg1 = math.hypot(
@@ -1319,12 +1356,10 @@ if map_data:
             if area is None:
                 continue
 
-            usable_area = area.buffer(-float(boundary_margin))
-            if usable_area.is_empty:
-                st.warning(
-                    "Området blev för litet efter säkerhetsmarginalen."
-                )
-                continue
+            # Store the raw selected polygon here. Track boundary margin is
+            # an option shown later in the UI, so it is deliberately NOT
+            # applied while processing the map event.
+            usable_area = area
 
             new_key = (
                 round(area.area, 1),
@@ -1423,7 +1458,7 @@ if st.session_state.drawn_area is not None:
 
     if st.session_state.preferred_start is None:
         st.caption(
-            "Valfri startpunkt: välj markörverktyget på kartan och placera en markör inom området."
+            "Valfri startpunkt: välj 'Startpunkt' ovan och klicka en gång inom området."
         )
     else:
         st.success("Önskad startpunkt vald.")
@@ -1594,10 +1629,53 @@ with st.expander("⚙️ Spårinställningar", expanded=True):
         )
 
 
+# Validate geometry settings before doing any OSM work or candidate search.
+n_legs = int(num_angles) + 1
+leg_bounds_valid = (
+    int(target_length) >= n_legs * int(min_leg)
+    and int(target_length) <= n_legs * int(max_leg)
+)
+
+if not leg_bounds_valid:
+    st.error(
+        f"Benlängderna är inte möjliga: {n_legs} ben × "
+        f"{int(min_leg)}–{int(max_leg)} m kan inte ge totalt "
+        f"{int(target_length)} m."
+    )
+
+# Apply the selected boundary margin only after the options have been rendered.
+# This keeps the map-before-options layout without referencing an undefined
+# setting during polygon selection.
+generation_area = None
+if st.session_state.drawn_area is not None:
+    generation_area = st.session_state.drawn_area.buffer(
+        -float(boundary_margin)
+    )
+    if generation_area.is_empty:
+        st.warning(
+            "Området blev för litet efter den valda säkerhetsmarginalen."
+        )
+        generation_area = None
+
+    elif (
+        st.session_state.preferred_start is not None
+        and not generation_area.covers(st.session_state.preferred_start)
+    ):
+        st.warning(
+            "Den valda startpunkten ligger innanför det ritade området men "
+            "utanför området efter vald kantmarginal. Flytta startpunkten "
+            "eller minska marginalen."
+        )
+
 st.divider()
 
 if st.session_state.drawn_area is not None:
-    minx, miny, maxx, maxy = st.session_state.drawn_area.bounds
+    bounds_area = (
+        generation_area
+        if generation_area is not None
+        else st.session_state.drawn_area
+    )
+    minx, miny, maxx, maxy = bounds_area.bounds
 
     lat1, lon1 = xy_ll(minx, miny, to_ll)
     lat2, lon2 = xy_ll(maxx, maxy, to_ll)
@@ -1639,10 +1717,13 @@ if st.session_state.drawn_area is not None:
         area_key,
     )
 
+    generation_ready = generation_area is not None and leg_bounds_valid
+
     if st.button(
         "🐕 Generera 5 spåralternativ",
         type="primary",
         use_container_width=True,
+        disabled=not generation_ready,
     ):
         try:
             # OSM data is fetched automatically when needed. The Overpass
@@ -1668,7 +1749,7 @@ if st.session_state.drawn_area is not None:
 
             with st.spinner("Genererar och utvärderar spår..."):
                 _, scored = generate_best(
-                    area=st.session_state.drawn_area,
+                    area=generation_area,
                     forest=layers["forest"],
                     soft=layers["soft"],
                     hard_geometry=layers["hard"],
@@ -1676,7 +1757,11 @@ if st.session_state.drawn_area is not None:
                     num_angles=int(num_angles),
                     num_objects=int(num_objects),
                     seed=int(seed),
-                    n_candidates=250,
+                    n_candidates=(
+                        140 if int(num_angles) <= 2
+                        else 190 if int(num_angles) <= 5
+                        else 230
+                    ),
                     min_leg=int(min_leg),
                     max_leg=int(max_leg),
                     preferred_start=st.session_state.preferred_start,
@@ -1734,7 +1819,10 @@ if st.session_state.drawn_area is not None:
             )
 
 
-if st.session_state.candidates:
+if (
+    st.session_state.candidates
+    and st.session_state.candidate_key == current_key
+):
     candidates = st.session_state.candidates
 
     labels = [
@@ -1838,10 +1926,7 @@ if st.session_state.candidates:
         if not layers["forest"].is_empty else 0
     )
 
-    nature = unary_union([
-        layers["forest"],
-        layers["soft"],
-    ])
+    nature = layers["forest"].union(layers["soft"])
 
     nature_length = (
         track.intersection(nature).length
