@@ -46,7 +46,7 @@ class RuleProfile:
 
 RULE_PROFILES = {
     "Appell": RuleProfile(
-        "Appell", 600, 4, 3, 60, 100, 10
+        "Appell", 300, 2, 3, 60, 100, 10
     ),
     "Lägre": RuleProfile(
         "Lägre", 1000, 5, 8, 100, 100, 10
@@ -839,6 +839,39 @@ def choose_objects(candidate, num_objects, rng):
       possible along the complete track.
     """
     track = candidate["geometry"]
+
+    # Appell has a fixed three-object layout:
+    # 1) middle of first leg
+    # 2) middle of second leg
+    # 3) exactly at the end of the track
+    #
+    # The candidate geometry contains one straight LineString made from the
+    # track vertices, so the first two leg lengths can be measured directly.
+    if num_objects == 3 and len(list(track.coords)) == 4 and abs(track.length - 300.0) <= 45.0:
+        coords = list(track.coords)
+        if len(coords) >= 4:
+            leg1 = math.hypot(
+                coords[1][0] - coords[0][0],
+                coords[1][1] - coords[0][1],
+            )
+            leg2 = math.hypot(
+                coords[2][0] - coords[1][0],
+                coords[2][1] - coords[1][1],
+            )
+            distances = [
+                0.5 * leg1,
+                leg1 + 0.5 * leg2,
+                float(track.length),
+            ]
+            return [
+                {
+                    "object": i,
+                    "distance_m": float(distance),
+                    "x": track.interpolate(float(distance)).x,
+                    "y": track.interpolate(float(distance)).y,
+                }
+                for i, distance in enumerate(distances, start=1)
+            ]
 
     if track.length <= 0 or num_objects <= 0:
         return []
