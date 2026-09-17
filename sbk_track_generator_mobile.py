@@ -645,16 +645,30 @@ def select_diverse_candidates(
 
 
 def choose_objects(candidate, num_objects, rng):
+    """
+    Place objects along the track.
+
+    The final object is always placed exactly at the end of the track.
+    Earlier objects are distributed between 10% and before the endpoint.
+    """
     track = candidate["geometry"]
 
     if track.length <= 0 or num_objects <= 0:
         return []
 
-    distances = np.linspace(
-        track.length * 0.10,
-        track.length * 0.90,
-        num_objects,
-    )
+    if num_objects == 1:
+        distances = np.array([track.length])
+    else:
+        # Keep the earlier objects distributed along the track, while
+        # reserving the exact endpoint for the final object.
+        earlier_distances = np.linspace(
+            track.length * 0.10,
+            track.length * 0.85,
+            num_objects - 1,
+        )
+        distances = np.concatenate(
+            [earlier_distances, np.array([track.length])]
+        )
 
     return [
         {
@@ -870,94 +884,98 @@ with st.expander("📍 Plats", expanded=True):
 
 
 with st.expander("⚙️ Spårinställningar", expanded=True):
-    profile_name = st.selectbox(
-        "Regelprofil",
-        list(RULE_PROFILES.keys()),
-    )
-    profile = RULE_PROFILES[profile_name]
+    basic_tab, advanced_tab = st.tabs(["Grundinställningar", "Advanced"])
 
-    target_length = st.number_input(
-        "Spårlängd (m)",
-        min_value=100,
-        max_value=5000,
-        value=profile.target_length,
-        step=100,
-    )
+    with basic_tab:
+        profile_name = st.selectbox(
+            "Regelprofil",
+            list(RULE_PROFILES.keys()),
+        )
+        profile = RULE_PROFILES[profile_name]
 
-    num_angles = st.number_input(
-        "Antal vinklar",
-        min_value=1,
-        max_value=20,
-        value=profile.angles,
-        step=1,
-    )
+        target_length = st.number_input(
+            "Spårlängd (m)",
+            min_value=100,
+            max_value=5000,
+            value=profile.target_length,
+            step=100,
+        )
 
-    num_objects = st.number_input(
-        "Antal objekt",
-        min_value=0,
-        max_value=20,
-        value=profile.objects,
-        step=1,
-    )
+        num_angles = st.number_input(
+            "Antal vinklar",
+            min_value=1,
+            max_value=20,
+            value=profile.angles,
+            step=1,
+        )
 
-    boundary_margin = st.number_input(
-        "Marginal från områdesgräns (m)",
-        min_value=0,
-        max_value=100,
-        value=profile.boundary_margin,
-        step=5,
-    )
+        num_objects = st.number_input(
+            "Antal objekt",
+            min_value=0,
+            max_value=20,
+            value=profile.objects,
+            step=1,
+        )
 
-    min_leg = st.number_input(
-        "Minsta benlängd (m)",
-        min_value=20,
-        max_value=500,
-        value=profile.min_leg,
-        step=10,
-    )
+    with advanced_tab:
+        boundary_margin = st.number_input(
+            "Marginal från områdesgräns (m)",
+            min_value=0,
+            max_value=100,
+            value=profile.boundary_margin,
+            step=5,
+        )
 
-    max_leg = st.number_input(
-        "Största benlängd (m)",
-        min_value=20,
-        max_value=500,
-        value=profile.max_leg,
-        step=10,
-    )
+        min_leg = st.number_input(
+            "Minsta benlängd (m)",
+            min_value=20,
+            max_value=500,
+            value=profile.min_leg,
+            step=10,
+        )
 
-    preferred_separation = st.number_input(
-        "Önskat avstånd mellan spårben (m)",
-        min_value=10,
-        max_value=100,
-        value=int(DEFAULT_PREFERRED_LEG_SEPARATION_M),
-        step=5,
-        help="Generatorn premierar minst detta avstånd mellan icke angränsande spårben.",
-    )
+        max_leg = st.number_input(
+            "Största benlängd (m)",
+            min_value=20,
+            max_value=500,
+            value=profile.max_leg,
+            step=10,
+        )
 
-    minimum_separation = st.number_input(
-        "Minsta tillåtna avstånd mellan spårben (m)",
-        min_value=5,
-        max_value=50,
-        value=int(DEFAULT_MIN_LEG_SEPARATION_M),
-        step=1,
-        help="Absolut gräns. Spårben får aldrig komma närmare än detta.",
-    )
+        preferred_separation = st.number_input(
+            "Önskat avstånd mellan spårben (m)",
+            min_value=10,
+            max_value=100,
+            value=int(DEFAULT_PREFERRED_LEG_SEPARATION_M),
+            step=5,
+            help="Generatorn premierar minst detta avstånd mellan icke angränsande spårben.",
+        )
 
-    start_radius = st.number_input(
-        "Tolerans kring vald startpunkt (m)",
-        min_value=0,
-        max_value=100,
-        value=25,
-        step=5,
-        help="Spåret försöker starta nära vald punkt inom denna radie.",
-    )
+        minimum_separation = st.number_input(
+            "Minsta tillåtna avstånd mellan spårben (m)",
+            min_value=5,
+            max_value=50,
+            value=int(DEFAULT_MIN_LEG_SEPARATION_M),
+            step=1,
+            help="Absolut gräns. Spårben får aldrig komma närmare än detta.",
+        )
 
-    seed = st.number_input(
-        "Slumpfrö",
-        min_value=0,
-        max_value=999999,
-        value=12345,
-        step=1,
-    )
+        start_radius = st.number_input(
+            "Tolerans kring vald startpunkt (m)",
+            min_value=0,
+            max_value=100,
+            value=25,
+            step=5,
+            help="Spåret försöker starta nära vald punkt inom denna radie.",
+        )
+
+        seed = st.number_input(
+            "Slumpfrö",
+            min_value=0,
+            max_value=999999,
+            value=12345,
+            step=1,
+        )
 
 
 if st.session_state.location is None:
