@@ -436,6 +436,7 @@ def generate_candidate(
     minimum_separation_m=12.0,
     exit_clearance_m=25.0,
     start_clearance_m=40.0,
+    appell_mode=False,
 ):
     """Generate an open, non-self-intersecting track with clear access."""
     if area is None or area.is_empty:
@@ -468,7 +469,12 @@ def generate_candidate(
             if previous_heading is None:
                 heading = float(rng.uniform(0.0, 360.0))
             else:
-                proposed_turn = float(rng.uniform(35.0, MAX_TURN_DEG))
+                if appell_mode:
+                    # Appell: each of the two angles must be 90° ±5°.
+                    proposed_turn = float(rng.uniform(85.0, 95.0))
+                else:
+                    proposed_turn = float(rng.uniform(35.0, MAX_TURN_DEG))
+
                 if rng.random() < 0.5:
                     proposed_turn = -proposed_turn
 
@@ -749,6 +755,7 @@ def generate_best(
     minimum_separation_m=12.0,
     exit_clearance_m=25.0,
     start_clearance_m=40.0,
+    appell_mode=False,
 ):
     rng = np.random.default_rng(seed)
     scored = []
@@ -772,6 +779,7 @@ def generate_best(
             minimum_separation_m=minimum_separation_m,
             exit_clearance_m=exit_clearance_m,
             start_clearance_m=start_clearance_m,
+            appell_mode=appell_mode,
         )
 
         if candidate is None:
@@ -1307,12 +1315,14 @@ lat, lon = st.session_state.location
 to_xy, to_ll = transformers(lat, lon)
 
 point_selection_mode = st.radio(
-    "Markörverktyget placerar",
-    ["Startpunkt", "Utgångspunkt"],
+    "Kartverktyg",
+    ["Rita område", "Startpunkt", "Utgångspunkt"],
+    index=0 if st.session_state.drawn_area is None else 1,
     horizontal=True,
     help=(
-        "Välj vad nästa markör på kartan ska betyda. "
-        "Utgångspunkten får ligga utanför det ritade området."
+        "Rita område använder polygonverktyget. För Startpunkt och "
+        "Utgångspunkt klickar du direkt en gång på kartan; inget separat "
+        "markörverktyg behövs."
     ),
 )
 
@@ -1373,147 +1383,155 @@ if st.session_state.preferred_exit is not None:
         icon=folium.Icon(color="red", icon="sign-out"),
     ).add_to(m)
 
-Draw(
-    export=False,
-    draw_options={
-        "polyline": False,
-        "rectangle": False,
-        "circle": False,
-        "circlemarker": False,
-        "marker": True,
-        "polygon": {
-            "allowIntersection": False,
-            "showArea": True,
+if point_selection_mode == "Rita område":
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "rectangle": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": {
+                "allowIntersection": False,
+                "showArea": True,
+            },
         },
-    },
-    edit_options={
-        "edit": True,
-        "remove": True,
-    },
-).add_to(m)
+        edit_options={
+            "edit": True,
+            "remove": True,
+        },
+    ).add_to(m)
 
 map_data = st_folium(
     m,
     width=None,
     height=520,
-    returned_objects=["all_drawings", "last_active_drawing"],
+    returned_objects=["all_drawings", "last_clicked"],
     key=f"track_area_map_{st.session_state.map_revision}",
 )
 
 
 if map_data:
     drawings = map_data.get("all_drawings", []) or []
-    active_drawing = map_data.get("last_active_drawing")
 
-    # Process polygons from the persistent drawing collection, but process a
-    # marker from the event that actually triggered this rerun. This matters
-    # when the polygon already exists: all_drawings can otherwise replay the
-    # older map state before the new marker is committed.
-    polygon_drawings = [
-        drawing
-        for drawing in drawings
-        if drawing.get("geometry", {}).get("type") == "Polygon"
-    ]
+    # Polygon state is handled only in area-drawing mode.
+    if point_selection_mode == "Rita område":
+        polygon_drawings = [
+            drawing
+            for drawing in drawings
+            if drawing.get("geometry", {}).get("type") == "Polygon"
+        ]
 
-    for drawing in polygon_drawings:
-        geometry = drawing.get("geometry", {})
-        geometry_type = geometry.get("type")
-
-        if geometry_type == "Polygon":
+        for drawing in polygon_drawings:
+            geometry = drawing.get("geometry", {})
             coordinates = geometry.get("coordinates", [])
-            if coordinates:
-                ring = coordinates[0]
-                coords = [
-                    (lat_value, lon_value)
-                    for lon_value, lat_value in ring
-                ]
-                area = folium_polygon_to_shapely(coords, to_xy)
+            if not coordinates:
+                continue
 
-                if area is not None:
-                    usable_area = area.buffer(-float(boundary_margin))
+            ring = coordinates[0]
+            coords = [
+                (lat_value, lon_value)
+                for lon_value, lat_value in ring
+            ]
+            area = folium_polygon_to_shapely(coords, to_xy)
 
-                    if usable_area.is_empty:
-                        st.warning(
-                            "Området blev för litet efter säkerhetsmarginalen."
+            if area is None:
+                continue
+
+            usable_area = area.buffer(-float(boundary_margin))
+            if usable_area.is_empty:
+                st.warning(
+                    "Området blev för litet efter säkerhetsmarginalen."
+                )
+                continue
+
+            new_key = (
+                round(area.area, 1),
+                round(area.centroid.x, 1),
+                round(area.centroid.y, 1),
+            )
+
+            if st.session_state.get("drawn_area_key") != new_key:
+                st.session_state.osm_layers = None
+                st.session_state.osm_area_key = None
+                st.session_state.candidates = None
+
+            st.session_state.drawn_area = usable_area
+            st.session_state.drawn_area_geojson = drawing
+            st.session_state.drawn_area_key = new_key
+
+    # Start/exit selection uses a plain Leaflet map click rather than a Draw
+    # marker. This avoids the transient marker layer that was disappearing on
+    # the first Streamlit rerun.
+    elif point_selection_mode in ("Startpunkt", "Utgångspunkt"):
+        clicked = map_data.get("last_clicked")
+
+        if clicked is not None:
+            point_lat = clicked.get("lat")
+            point_lon = clicked.get("lng")
+
+            if point_lat is not None and point_lon is not None:
+                px, py = to_xy.transform(float(point_lon), float(point_lat))
+                selected_point = Point(px, py)
+
+                if point_selection_mode == "Startpunkt":
+                    if (
+                        st.session_state.drawn_area is not None
+                        and st.session_state.drawn_area.covers(selected_point)
+                    ):
+                        old_start = st.session_state.get("preferred_start")
+                        changed = (
+                            old_start is None
+                            or old_start.distance(selected_point) > 0.5
                         )
-                    else:
-                        new_key = (
-                            round(area.area, 1),
-                            round(area.centroid.x, 1),
-                            round(area.centroid.y, 1),
-                        )
-
-                        if st.session_state.get("drawn_area_key") != new_key:
-                            st.session_state.osm_layers = None
-                            st.session_state.osm_area_key = None
+                        if changed:
+                            st.session_state.preferred_start = selected_point
+                            st.session_state.preferred_start_geojson = {
+                                "type": "Feature",
+                                "properties": {},
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        float(point_lon),
+                                        float(point_lat),
+                                    ],
+                                },
+                            }
                             st.session_state.candidates = None
 
-                        st.session_state.drawn_area = usable_area
-                        st.session_state.drawn_area_geojson = drawing
-                        st.session_state.drawn_area_key = new_key
+                            # Create a fresh map instance containing the SAVED
+                            # green marker. Unlike Draw markers, the click does
+                            # not need to survive the rerun itself.
+                            st.session_state.map_revision += 1
+                            st.rerun()
+                    else:
+                        st.warning(
+                            "Startpunkten måste ligga inom det användbara området."
+                        )
 
-    # A marker is an interaction event, not persistent polygon state. Prefer
-    # last_active_drawing so the FIRST marker click is handled immediately.
-    point_drawing = None
-    if (
-        active_drawing is not None
-        and active_drawing.get("geometry", {}).get("type") == "Point"
-    ):
-        point_drawing = active_drawing
-    else:
-        # Compatibility fallback for older streamlit-folium versions.
-        for candidate_drawing in reversed(drawings):
-            if candidate_drawing.get("geometry", {}).get("type") == "Point":
-                point_drawing = candidate_drawing
-                break
-
-    if point_drawing is not None:
-        drawing = point_drawing
-        geometry = drawing.get("geometry", {})
-        geometry_type = geometry.get("type")
-        if geometry_type == "Point":
-            coordinates = geometry.get("coordinates", [])
-        if len(coordinates) >= 2:
-            point_lon, point_lat = coordinates[:2]
-            px, py = to_xy.transform(point_lon, point_lat)
-            selected_point = Point(px, py)
-
-            if point_selection_mode == "Startpunkt":
-                if (
-                    st.session_state.drawn_area is not None
-                    and st.session_state.drawn_area.covers(selected_point)
-                ):
-                    old_start = st.session_state.get("preferred_start")
-                    changed = (
-                        old_start is None
-                        or old_start.distance(selected_point) > 0.5
-                    )
-                    st.session_state.preferred_start = selected_point
-                    st.session_state.preferred_start_geojson = drawing
-                    if changed:
-                        # st_folium returns the marker only after this map
-                        # instance has already been constructed. Commit the
-                        # point to session state, then deliberately create a
-                        # NEW Folium component on the rerun. The new map is
-                        # built from preferred_start, so one click is enough
-                        # and the saved green marker remains visible.
-                        st.session_state.candidates = None
                 else:
-                    st.warning(
-                        "Startpunkten måste ligga inom det användbara området."
+                    old_exit = st.session_state.get("preferred_exit")
+                    changed = (
+                        old_exit is None
+                        or old_exit.distance(selected_point) > 0.5
                     )
-            else:
-                old_exit = st.session_state.get("preferred_exit")
-                changed = (
-                    old_exit is None
-                    or old_exit.distance(selected_point) > 0.5
-                )
-                # The exit point may deliberately be outside the polygon.
-                st.session_state.preferred_exit = selected_point
-                st.session_state.preferred_exit_geojson = drawing
-                if changed:
-                    # Commit the exit marker in exactly the same way.
-                    st.session_state.candidates = None
+                    if changed:
+                        st.session_state.preferred_exit = selected_point
+                        st.session_state.preferred_exit_geojson = {
+                            "type": "Feature",
+                            "properties": {},
+                            "geometry": {
+                                "type": "Point",
+                                "coordinates": [
+                                    float(point_lon),
+                                    float(point_lat),
+                                ],
+                            },
+                        }
+                        st.session_state.candidates = None
+                        st.session_state.map_revision += 1
+                        st.rerun()
 
 if st.session_state.drawn_area is not None:
     area_ha = st.session_state.drawn_area.area / 10_000
@@ -1668,6 +1686,7 @@ if st.session_state.drawn_area is not None:
                     minimum_separation_m=float(minimum_separation),
                     exit_clearance_m=float(exit_clearance),
                     start_clearance_m=float(start_clearance),
+                    appell_mode=(selected_profile == "Appell"),
                 )
 
                 selected = select_diverse_candidates(
