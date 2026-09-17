@@ -2047,14 +2047,3 @@ if (
         )
 
 
-with st.expander("📱 "):
-    st.write(
-        """
-        Appen kan användas i Chrome på  när den är
-        publicerad på Streamlit Cloud.
-
-        1. Öppna appen i Chrome.
-        2. Öppna menyn ⋮.
-        3. Välj "Lägg till på startskärmen".
-        """
-    )
