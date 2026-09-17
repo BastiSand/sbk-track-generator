@@ -63,6 +63,7 @@ for key, value in {
     "location": None,
     "drawn_area": None,
     "drawn_area_geojson": None,
+    "drawn_area_key": None,
     "osm_layers": None,
     "osm_area_key": None,
     "osm_count": 0,
@@ -767,6 +768,7 @@ with st.expander("📍 Plats", expanded=True):
                 st.session_state.location = parsed
                 st.session_state.drawn_area = None
                 st.session_state.drawn_area_geojson = None
+                st.session_state.drawn_area_key = None
                 st.session_state.osm_layers = None
                 st.session_state.osm_area_key = None
                 st.session_state.candidates = None
