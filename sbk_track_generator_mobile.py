@@ -31,6 +31,7 @@ DEFAULT_START_CLEARANCE_M = 40.0
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 ]
 
 
@@ -74,6 +75,7 @@ for key, value in {
     "osm_layers": None,
     "osm_area_key": None,
     "osm_count": 0,
+    "osm_reduced": False,
     "candidates": None,
     "candidate_key": None,
 }.items():
@@ -249,12 +251,13 @@ def segment_allowed(
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def overpass_query(south, west, north, east):
+    import random
     import requests
 
     bbox = f"{south},{west},{north},{east}"
 
-    query = f"""
-    [out:json][timeout:35];
+    full_query = f"""
+    [out:json][timeout:50];
     (
       nwr["landuse"~"^(forest|meadow|grass|farmland|residential|industrial|commercial|quarry)$"]({bbox});
       nwr["natural"~"^(wood|scrub|water)$"]({bbox});
@@ -266,23 +269,61 @@ def overpass_query(south, west, north, east):
     out geom;
     """
 
-    last_error = None
+    # If public Overpass instances are overloaded, this smaller query still
+    # supplies the geometry most important for safe track generation.
+    fallback_query = f"""
+    [out:json][timeout:70];
+    (
+      nwr["natural"~"^(wood|water)$"]({bbox});
+      nwr["landuse"~"^(forest|residential|industrial|commercial|quarry)$"]({bbox});
+      way["highway"]({bbox});
+      nwr["building"]({bbox});
+      way["barrier"]({bbox});
+    );
+    out geom;
+    """
 
-    for endpoint in OVERPASS_ENDPOINTS:
+    endpoints = list(OVERPASS_ENDPOINTS)
+    random.shuffle(endpoints)
+    errors = []
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "SBK-Spargenerator/1.0"})
+
+    # Try all servers with the complete dataset first. GET is useful here
+    # because public/proxy caches can serve identical bbox queries quickly.
+    for endpoint in endpoints:
         try:
-            response = requests.post(
+            response = session.get(
                 endpoint,
-                data=query,
-                timeout=42,
-                headers={"User-Agent": "SBK-Spårgenerator/1.0"},
+                params={"data": full_query},
+                timeout=(8, 32),
             )
             response.raise_for_status()
             return response.json()
         except Exception as exc:
-            last_error = exc
+            errors.append(f"{endpoint}: {exc}")
+
+    # Retry with the reduced safety-oriented query and a more generous read
+    # timeout. This avoids failing the whole application just because one
+    # optional terrain category is expensive to retrieve.
+    for endpoint in endpoints:
+        try:
+            response = session.post(
+                endpoint,
+                data={"data": fallback_query},
+                timeout=(10, 70),
+            )
+            response.raise_for_status()
+            result = response.json()
+            result["_reduced_osm_query"] = True
+            return result
+        except Exception as exc:
+            errors.append(f"{endpoint}: {exc}")
 
     raise RuntimeError(
-        f"Kunde inte hämta OSM-data från Overpass: {last_error}"
+        "Alla Overpass-servrar svarade för långsamt eller med fel. "
+        "Försök igen om en liten stund. Senaste fel: " + errors[-1]
     )
 
 
@@ -1826,8 +1867,18 @@ if st.session_state.drawn_area is not None:
                     st.session_state.osm_count = len(
                         data.get("elements", [])
                     )
+                    st.session_state.osm_reduced = bool(
+                        data.get("_reduced_osm_query", False)
+                    )
 
             layers = st.session_state.osm_layers
+
+            if st.session_state.get("osm_reduced", False):
+                st.info(
+                    "Overpass var långsamt. En reducerad kartfråga användes "
+                    "för denna körning; de viktigaste hindren finns kvar, men "
+                    "vissa terrängkategorier kan saknas."
+                )
 
             with st.spinner("Genererar och utvärderar spår..."):
                 _, scored = generate_best(
