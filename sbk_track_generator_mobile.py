@@ -1178,45 +1178,6 @@ if st.session_state.drawn_area is not None:
         round(east, 5),
     )
 
-    if st.button(
-        "🗺️ Hämta OSM-data",
-        use_container_width=True,
-    ):
-        with st.spinner("Hämtar OSM-data..."):
-            try:
-                data = overpass_query(
-                    south, west, north, east
-                )
-
-                st.session_state.osm_layers = (
-                    build_osm_layers(data, to_xy)
-                )
-                st.session_state.osm_area_key = area_key
-                st.session_state.osm_count = len(
-                    data.get("elements", [])
-                )
-                st.session_state.candidates = None
-
-                st.success(
-                    f"OSM-data hämtad "
-                    f"({st.session_state.osm_count} objekt)."
-                )
-            except Exception as exc:
-                st.error(str(exc))
-
-    if st.session_state.osm_layers is not None:
-        st.caption(
-            f"OSM-data finns sparad för området "
-            f"({st.session_state.osm_count} objekt)."
-        )
-
-
-if (
-    st.session_state.drawn_area is not None
-    and st.session_state.osm_layers is not None
-):
-    st.divider()
-
     current_key = (
         profile_name,
         int(target_length),
@@ -1233,7 +1194,7 @@ if (
             round(st.session_state.preferred_start.x, 1),
             round(st.session_state.preferred_start.y, 1),
         ) if st.session_state.preferred_start is not None else None,
-        st.session_state.osm_area_key,
+        area_key,
     )
 
     if st.button(
@@ -1241,64 +1202,90 @@ if (
         type="primary",
         use_container_width=True,
     ):
-        layers = st.session_state.osm_layers
-
-        with st.spinner("Genererar och utvärderar spår..."):
-            _, scored = generate_best(
-                area=st.session_state.drawn_area,
-                forest=layers["forest"],
-                soft=layers["soft"],
-                hard_geometry=layers["hard"],
-                target_length=int(target_length),
-                num_angles=int(num_angles),
-                num_objects=int(num_objects),
-                seed=int(seed),
-                n_candidates=250,
-                min_leg=int(min_leg),
-                max_leg=int(max_leg),
-                preferred_start=st.session_state.preferred_start,
-                start_radius_m=float(start_radius),
-                preferred_separation_m=float(preferred_separation),
-                minimum_separation_m=float(minimum_separation),
-            )
-
-            selected = select_diverse_candidates(
-                scored,
-                max_count=5,
-                min_shape_distance=35.0,
-            )
-
-            rng = np.random.default_rng(int(seed))
-            candidates = []
-
-            for rank, (score, candidate) in enumerate(
-                selected, start=1
+        try:
+            # OSM data is fetched automatically when needed. The Overpass
+            # request itself is cached, and the processed layers are also
+            # retained in session state while the selected area is unchanged.
+            if (
+                st.session_state.osm_layers is None
+                or st.session_state.osm_area_key != area_key
             ):
-                objects = choose_objects(
-                    candidate,
-                    int(num_objects),
-                    rng,
+                with st.spinner("Hämtar kartdata och analyserar området..."):
+                    data = overpass_query(
+                        south, west, north, east
+                    )
+                    st.session_state.osm_layers = build_osm_layers(
+                        data, to_xy
+                    )
+                    st.session_state.osm_area_key = area_key
+                    st.session_state.osm_count = len(
+                        data.get("elements", [])
+                    )
+
+            layers = st.session_state.osm_layers
+
+            with st.spinner("Genererar och utvärderar spår..."):
+                _, scored = generate_best(
+                    area=st.session_state.drawn_area,
+                    forest=layers["forest"],
+                    soft=layers["soft"],
+                    hard_geometry=layers["hard"],
+                    target_length=int(target_length),
+                    num_angles=int(num_angles),
+                    num_objects=int(num_objects),
+                    seed=int(seed),
+                    n_candidates=250,
+                    min_leg=int(min_leg),
+                    max_leg=int(max_leg),
+                    preferred_start=st.session_state.preferred_start,
+                    start_radius_m=float(start_radius),
+                    preferred_separation_m=float(preferred_separation),
+                    minimum_separation_m=float(minimum_separation),
                 )
 
-                candidates.append({
-                    "rank": rank,
-                    "score": score,
-                    "candidate": candidate,
-                    "objects": objects,
-                })
-
-            st.session_state.candidates = candidates
-            st.session_state.candidate_key = current_key
-
-            if not candidates:
-                st.error(
-                    "Kunde inte generera något giltigt spår "
-                    "inom det valda området."
+                selected = select_diverse_candidates(
+                    scored,
+                    max_count=5,
+                    min_shape_distance=35.0,
                 )
-            else:
-                st.success(
-                    f"{len(candidates)} spåralternativ genererade."
-                )
+
+                rng = np.random.default_rng(int(seed))
+                candidates = []
+
+                for rank, (score, candidate) in enumerate(
+                    selected, start=1
+                ):
+                    objects = choose_objects(
+                        candidate,
+                        int(num_objects),
+                        rng,
+                    )
+
+                    candidates.append({
+                        "rank": rank,
+                        "score": score,
+                        "candidate": candidate,
+                        "objects": objects,
+                    })
+
+                st.session_state.candidates = candidates
+                st.session_state.candidate_key = current_key
+
+                if not candidates:
+                    st.error(
+                        "Kunde inte generera något giltigt spår "
+                        "inom det valda området."
+                    )
+                else:
+                    st.success(
+                        f"{len(candidates)} spåralternativ genererade."
+                    )
+
+        except Exception as exc:
+            st.error(
+                "Kunde inte hämta kartdata eller generera spår: "
+                f"{exc}"
+            )
 
 
 if st.session_state.candidates:
