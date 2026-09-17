@@ -1686,7 +1686,7 @@ if st.session_state.drawn_area is not None:
                     minimum_separation_m=float(minimum_separation),
                     exit_clearance_m=float(exit_clearance),
                     start_clearance_m=float(start_clearance),
-                    appell_mode=(selected_profile == "Appell"),
+                    appell_mode=(profile_name == "Appell"),
                 )
 
                 selected = select_diverse_candidates(
