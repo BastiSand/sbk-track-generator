@@ -25,6 +25,7 @@ MAX_TURN_DEG = 90.0
 DEFAULT_PREFERRED_LEG_SEPARATION_M = 25.0
 DEFAULT_MIN_LEG_SEPARATION_M = 12.0
 DEFAULT_EXIT_CLEARANCE_M = 25.0
+DEFAULT_START_CLEARANCE_M = 40.0
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -422,8 +423,9 @@ def generate_candidate(
     preferred_separation_m=25.0,
     minimum_separation_m=12.0,
     exit_clearance_m=25.0,
+    start_clearance_m=40.0,
 ):
-    """Generate a simple track with a preferred leg separation."""
+    """Generate an open, non-self-intersecting track with clear access."""
     if area is None or area.is_empty:
         return None
 
@@ -442,24 +444,93 @@ def generate_candidate(
     current = start
     previous_heading = None
     accepted_segments = []
+    signed_turns = []
+    track_length_so_far = 0.0
     minimum_observed_separation = float("inf")
 
     for leg_length in leg_lengths:
         accepted = False
 
         for _ in range(160):
+            proposed_turn = None
             if previous_heading is None:
                 heading = float(rng.uniform(0.0, 360.0))
             else:
-                turn = float(rng.uniform(35.0, MAX_TURN_DEG))
+                proposed_turn = float(rng.uniform(35.0, MAX_TURN_DEG))
                 if rng.random() < 0.5:
-                    turn = -turn
-                heading = (previous_heading + turn) % 360.0
+                    proposed_turn = -proposed_turn
+
+                # Consecutive turns may continue in the same direction.
+                # When they do, the leg length is adapted below so the path
+                # expands outward instead of curling tightly around its start.
+                heading = (previous_heading + proposed_turn) % 360.0
+
+            # Adapt leg length when several turns continue in the same
+            # direction. The more the path has turned, and the closer the
+            # current point is to the start, the more strongly we extend the
+            # next leg outward. This allows >180° cumulative turning without
+            # producing a tight spiral around the start.
+            adjusted_leg_length = float(leg_length)
+
+            if proposed_turn is not None:
+                same_direction_total = abs(proposed_turn)
+                same_direction_count = 1
+
+                for old_turn in reversed(signed_turns):
+                    if old_turn * proposed_turn <= 0:
+                        break
+                    same_direction_total += abs(old_turn)
+                    same_direction_count += 1
+
+                if same_direction_total > 120.0:
+                    radial_distance = current.distance(start)
+
+                    # Desired radial scale grows as cumulative turning grows.
+                    # This is deliberately a preference through leg extension;
+                    # all ordinary area/obstacle/spacing checks still apply.
+                    turn_factor = min(
+                        max((same_direction_total - 120.0) / 180.0, 0.0),
+                        1.5,
+                    )
+                    desired_radius = (
+                        float(start_clearance_m)
+                        + 0.18 * track_length_so_far
+                        + 35.0 * turn_factor
+                    )
+
+                    if radial_distance < desired_radius:
+                        extension = min(
+                            desired_radius - radial_distance,
+                            float(max_leg) * 0.75,
+                        )
+                        adjusted_leg_length += extension
+
+                    # Successive same-direction turns should generally not
+                    # become progressively shorter, which is a common cause
+                    # of inward curling.
+                    if accepted_segments:
+                        previous_length = accepted_segments[-1].length
+                        growth = 1.0 + min(
+                            0.08 * max(same_direction_count - 1, 0),
+                            0.30,
+                        )
+                        adjusted_leg_length = max(
+                            adjusted_leg_length,
+                            previous_length * growth,
+                        )
+
+            # Keep adaptive legs within a sensible upper bound. This bound is
+            # intentionally above the normal max_leg because the adjustment
+            # is specifically used to open a long same-direction sequence.
+            adjusted_leg_length = min(
+                adjusted_leg_length,
+                max(float(max_leg) * 1.6, float(leg_length)),
+            )
 
             angle_rad = math.radians(heading)
             candidate_point = Point(
-                current.x + leg_length * math.cos(angle_rad),
-                current.y + leg_length * math.sin(angle_rad),
+                current.x + adjusted_leg_length * math.cos(angle_rad),
+                current.y + adjusted_leg_length * math.sin(angle_rad),
             )
             segment = LineString([
                 (current.x, current.y),
@@ -474,6 +545,14 @@ def generate_candidate(
             if any(segment.intersects(old) for old in non_adjacent_segments):
                 continue
 
+            # After the first two legs, do not let the track return close to
+            # its own start. This leaves an open access/escape zone instead of
+            # wrapping later legs around the starting position.
+            if len(accepted_segments) >= 2:
+                start_zone = start.buffer(float(start_clearance_m))
+                if segment.intersects(start_zone):
+                    continue
+
             distances = [
                 segment.distance(old) for old in non_adjacent_segments
             ]
@@ -485,6 +564,7 @@ def generate_candidate(
 
             points.append(candidate_point)
             accepted_segments.append(segment)
+            track_length_so_far += segment.length
             current = candidate_point
             previous_heading = heading
             minimum_observed_separation = min(
@@ -497,6 +577,15 @@ def generate_candidate(
             return None
 
     track = LineString([(point.x, point.y) for point in points])
+
+    # Adaptive anti-curling can change the nominal total length. Keep only
+    # candidates reasonably close to the requested length; scoring below
+    # further prefers the closest ones.
+    length_error_ratio = abs(track.length - target_length) / max(
+        float(target_length), 1.0
+    )
+    if length_error_ratio > 0.15:
+        return None
 
     if not area.covers(track):
         return None
@@ -514,12 +603,17 @@ def generate_candidate(
         if preferred_start is not None else 0.0
     )
 
+    # Reward tracks that progress away from the start rather than folding
+    # back around it. This is a preference rather than a hard endpoint rule.
+    end_point = Point(track.coords[-1])
+    start_to_end_distance = start.distance(end_point)
+    openness_ratio = start_to_end_distance / max(track.length, 1.0)
+
     exit_distance = 0.0
     exit_clearance = float("inf")
     exit_segment = None
 
     if preferred_exit is not None:
-        end_point = Point(track.coords[-1])
         exit_distance = end_point.distance(preferred_exit)
         exit_segment = LineString([
             (end_point.x, end_point.y),
@@ -555,6 +649,9 @@ def generate_candidate(
         "exit_clearance": float(exit_clearance),
         "exit_segment": exit_segment,
         "preferred_exit_clearance": float(exit_clearance_m),
+        "start_to_end_distance": float(start_to_end_distance),
+        "openness_ratio": float(openness_ratio),
+        "length_error_ratio": float(length_error_ratio),
     }
 
 
@@ -599,11 +696,23 @@ def candidate_score(candidate, forest, soft):
         exit_clearance / preferred_exit_clearance, 1.0
     ) * 35.0
 
+    # Strongly prefer an open, progressing shape. A folded/loop-like track
+    # has a small straight-line start-to-end distance relative to its length.
+    openness_bonus = min(
+        candidate.get("openness_ratio", 0.0) / 0.35, 1.0
+    ) * 45.0
+
+    # Adaptive leg lengths are allowed, but candidates closest to the user's
+    # requested total length are preferred.
+    length_penalty = candidate.get("length_error_ratio", 0.0) * 180.0
+
     return (
         forest_length / track.length * 100.0
         + soft_length / track.length * 35.0
         + separation_bonus
         + exit_clearance_bonus
+        + openness_bonus
+        - length_penalty
         - start_penalty
         - exit_distance_penalty
     )
@@ -627,6 +736,7 @@ def generate_best(
     preferred_separation_m=25.0,
     minimum_separation_m=12.0,
     exit_clearance_m=25.0,
+    start_clearance_m=40.0,
 ):
     rng = np.random.default_rng(seed)
     scored = []
@@ -649,6 +759,7 @@ def generate_best(
             preferred_separation_m=preferred_separation_m,
             minimum_separation_m=minimum_separation_m,
             exit_clearance_m=exit_clearance_m,
+            start_clearance_m=start_clearance_m,
         )
 
         if candidate is None:
@@ -1044,6 +1155,19 @@ with st.expander("⚙️ Spårinställningar", expanded=True):
             ),
         )
 
+        start_clearance = st.number_input(
+            "Fri zon runt start efter inledningen (m)",
+            min_value=20,
+            max_value=100,
+            value=int(DEFAULT_START_CLEARANCE_M),
+            step=5,
+            help=(
+                "Efter de två första spårbenen får senare ben inte återvända "
+                "in i denna zon runt starten. Motverkar att spåret ringlar "
+                "runt och stänger in startområdet."
+            ),
+        )
+
         seed = st.number_input(
             "Slumpfrö",
             min_value=0,
@@ -1318,6 +1442,7 @@ if st.session_state.drawn_area is not None:
         int(minimum_separation),
         int(start_radius),
         int(exit_clearance),
+        int(start_clearance),
         (
             round(st.session_state.preferred_start.x, 1),
             round(st.session_state.preferred_start.y, 1),
@@ -1375,6 +1500,7 @@ if st.session_state.drawn_area is not None:
                     preferred_separation_m=float(preferred_separation),
                     minimum_separation_m=float(minimum_separation),
                     exit_clearance_m=float(exit_clearance),
+                    start_clearance_m=float(start_clearance),
                 )
 
                 selected = select_diverse_candidates(
@@ -1565,6 +1691,16 @@ if st.session_state.candidates:
             "Start från vald punkt",
             f"{candidate.get('start_distance', 0.0):.0f} m",
         )
+
+    openness_cols = st.columns(2)
+    openness_cols[0].metric(
+        "Start–slut fågelväg",
+        f"{candidate.get('start_to_end_distance', 0.0):.0f} m",
+    )
+    openness_cols[1].metric(
+        "Öppenhet",
+        f"{candidate.get('openness_ratio', 0.0) * 100:.0f} %",
+    )
 
     if st.session_state.preferred_exit is not None:
         exit_cols = st.columns(2)
