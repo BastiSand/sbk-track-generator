@@ -22,7 +22,8 @@ CACHE_TTL = 900
 
 # Track geometry preferences
 MAX_TURN_DEG = 90.0
-MIN_LEG_SEPARATION_M = 25.0
+DEFAULT_PREFERRED_LEG_SEPARATION_M = 25.0
+DEFAULT_MIN_LEG_SEPARATION_M = 12.0
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -68,6 +69,8 @@ for key, value in {
     "drawn_area": None,
     "drawn_area_geojson": None,
     "drawn_area_key": None,
+    "preferred_start": None,
+    "preferred_start_geojson": None,
     "osm_layers": None,
     "osm_area_key": None,
     "osm_count": 0,
@@ -168,6 +171,29 @@ def sample_point_in_area(area, rng, max_attempts=2000):
             return point
 
     return None
+
+
+def choose_start_point(area, rng, preferred_start=None, radius_m=35.0):
+    """Choose a start point, preferring the user's selected map position."""
+    if preferred_start is None:
+        return sample_point_in_area(area, rng)
+
+    if not area.covers(preferred_start):
+        return None
+
+    # Try positions near the selected point so generation is not forced to
+    # fail merely because the exact point gives an impossible first leg.
+    for _ in range(80):
+        distance = float(rng.uniform(0.0, radius_m))
+        angle = float(rng.uniform(0.0, 2.0 * math.pi))
+        point = Point(
+            preferred_start.x + distance * math.cos(angle),
+            preferred_start.y + distance * math.sin(angle),
+        )
+        if area.covers(point):
+            return point
+
+    return preferred_start
 
 
 def segment_allowed(segment, area, hard_geometry=None):
@@ -387,38 +413,39 @@ def generate_candidate(
     rng,
     min_leg=60,
     max_leg=100,
+    preferred_start=None,
+    start_radius_m=35.0,
+    preferred_separation_m=25.0,
+    minimum_separation_m=12.0,
 ):
-    """Generate a non-self-intersecting track with well-spaced legs."""
+    """Generate a simple track with a preferred leg separation."""
     if area is None or area.is_empty:
         return None
 
-    start = sample_point_in_area(area, rng)
+    start = choose_start_point(
+        area, rng, preferred_start=preferred_start, radius_m=start_radius_m
+    )
     if start is None:
         return None
 
     points = [start]
     leg_lengths = random_segment_lengths(
-        target_length,
-        num_angles,
-        rng,
-        min_leg=min_leg,
-        max_leg=max_leg,
+        target_length, num_angles, rng,
+        min_leg=min_leg, max_leg=max_leg,
     )
 
     current = start
     previous_heading = None
     accepted_segments = []
+    minimum_observed_separation = float("inf")
 
     for leg_length in leg_lengths:
         accepted = False
 
-        for _ in range(120):
+        for _ in range(160):
             if previous_heading is None:
                 heading = float(rng.uniform(0.0, 360.0))
             else:
-                # Prefer distinct angles while limiting the change in heading
-                # to 90 degrees. Thus no generated turn is sharper than a
-                # right-angle turn.
                 turn = float(rng.uniform(35.0, MAX_TURN_DEG))
                 if rng.random() < 0.5:
                     turn = -turn
@@ -429,7 +456,6 @@ def generate_candidate(
                 current.x + leg_length * math.cos(angle_rad),
                 current.y + leg_length * math.sin(angle_rad),
             )
-
             segment = LineString([
                 (current.x, current.y),
                 (candidate_point.x, candidate_point.y),
@@ -438,26 +464,27 @@ def generate_candidate(
             if not segment_allowed(segment, area, hard_geometry):
                 continue
 
-            # Ignore the immediately preceding leg because the two legs must
-            # meet at their common angle point.
             non_adjacent_segments = accepted_segments[:-1]
 
-            # Never allow the track to cross or touch an earlier,
-            # non-adjacent leg.
             if any(segment.intersects(old) for old in non_adjacent_segments):
                 continue
 
-            # Prefer at least 25 m between non-adjacent legs.
-            if any(
-                segment.distance(old) < MIN_LEG_SEPARATION_M
-                for old in non_adjacent_segments
-            ):
+            distances = [
+                segment.distance(old) for old in non_adjacent_segments
+            ]
+            closest = min(distances) if distances else float("inf")
+
+            # Absolute floor: never accept legs closer than this.
+            if closest < minimum_separation_m:
                 continue
 
             points.append(candidate_point)
             accepted_segments.append(segment)
             current = candidate_point
             previous_heading = heading
+            minimum_observed_separation = min(
+                minimum_observed_separation, closest
+            )
             accepted = True
             break
 
@@ -468,19 +495,27 @@ def generate_candidate(
 
     if not area.covers(track):
         return None
-
     if hard_geometry is not None and not hard_geometry.is_empty:
         if track.intersects(hard_geometry):
             return None
-
-    # Final safeguard against all forms of LineString self-intersection.
     if not track.is_simple:
         return None
+
+    if minimum_observed_separation == float("inf"):
+        minimum_observed_separation = preferred_separation_m
+
+    start_distance = (
+        start.distance(preferred_start)
+        if preferred_start is not None else 0.0
+    )
 
     return {
         "geometry": track,
         "length": track.length,
         "points": points,
+        "min_separation": float(minimum_observed_separation),
+        "preferred_separation": float(preferred_separation_m),
+        "start_distance": float(start_distance),
     }
 
 
@@ -494,15 +529,26 @@ def candidate_score(candidate, forest, soft):
         track.intersection(forest).length
         if not forest.is_empty else 0
     )
-
     soft_length = (
         track.intersection(soft).length
         if not soft.is_empty else 0
     )
 
+    preferred = max(candidate.get("preferred_separation", 25.0), 1.0)
+    separation = candidate.get("min_separation", preferred)
+
+    # Full bonus at the preferred distance; progressively smaller bonus
+    # below it. The absolute minimum is enforced by generate_candidate().
+    separation_bonus = min(separation / preferred, 1.0) * 30.0
+
+    # Prefer candidates starting close to the user's chosen point.
+    start_penalty = min(candidate.get("start_distance", 0.0), 100.0) * 0.35
+
     return (
         forest_length / track.length * 100.0
         + soft_length / track.length * 35.0
+        + separation_bonus
+        - start_penalty
     )
 
 
@@ -518,6 +564,10 @@ def generate_best(
     n_candidates=250,
     min_leg=60,
     max_leg=100,
+    preferred_start=None,
+    start_radius_m=35.0,
+    preferred_separation_m=25.0,
+    minimum_separation_m=12.0,
 ):
     rng = np.random.default_rng(seed)
     scored = []
@@ -534,6 +584,10 @@ def generate_best(
             rng=rng,
             min_leg=min_leg,
             max_leg=max_leg,
+            preferred_start=preferred_start,
+            start_radius_m=start_radius_m,
+            preferred_separation_m=preferred_separation_m,
+            minimum_separation_m=minimum_separation_m,
         )
 
         if candidate is None:
@@ -793,6 +847,8 @@ with st.expander("📍 Plats", expanded=True):
                 st.session_state.drawn_area = None
                 st.session_state.drawn_area_geojson = None
                 st.session_state.drawn_area_key = None
+                st.session_state.preferred_start = None
+                st.session_state.preferred_start_geojson = None
                 st.session_state.osm_layers = None
                 st.session_state.osm_area_key = None
                 st.session_state.candidates = None
@@ -868,6 +924,33 @@ with st.expander("⚙️ Spårinställningar", expanded=True):
         step=10,
     )
 
+    preferred_separation = st.number_input(
+        "Önskat avstånd mellan spårben (m)",
+        min_value=10,
+        max_value=100,
+        value=int(DEFAULT_PREFERRED_LEG_SEPARATION_M),
+        step=5,
+        help="Generatorn premierar minst detta avstånd mellan icke angränsande spårben.",
+    )
+
+    minimum_separation = st.number_input(
+        "Minsta tillåtna avstånd mellan spårben (m)",
+        min_value=5,
+        max_value=50,
+        value=int(DEFAULT_MIN_LEG_SEPARATION_M),
+        step=1,
+        help="Absolut gräns. Spårben får aldrig komma närmare än detta.",
+    )
+
+    start_radius = st.number_input(
+        "Tolerans kring vald startpunkt (m)",
+        min_value=0,
+        max_value=100,
+        value=25,
+        step=5,
+        help="Spåret försöker starta nära vald punkt inom denna radie.",
+    )
+
     seed = st.number_input(
         "Slumpfrö",
         min_value=0,
@@ -909,6 +992,19 @@ if st.session_state.drawn_area_geojson is not None:
         },
     ).add_to(m)
 
+
+if st.session_state.preferred_start is not None:
+    start_lat, start_lon = xy_ll(
+        st.session_state.preferred_start.x,
+        st.session_state.preferred_start.y,
+        to_ll,
+    )
+    folium.Marker(
+        [start_lat, start_lon],
+        tooltip="Önskad startpunkt",
+        icon=folium.Icon(color="green", icon="play"),
+    ).add_to(m)
+
 Draw(
     export=False,
     draw_options={
@@ -916,7 +1012,7 @@ Draw(
         "rectangle": False,
         "circle": False,
         "circlemarker": False,
-        "marker": False,
+        "marker": True,
         "polygon": {
             "allowIntersection": False,
             "showArea": True,
@@ -937,37 +1033,28 @@ map_data = st_folium(
 
 
 if map_data:
-    drawings = map_data.get("all_drawings", [])
+    drawings = map_data.get("all_drawings", []) or []
 
-    if drawings:
-        drawing = drawings[-1]
+    for drawing in drawings:
         geometry = drawing.get("geometry", {})
+        geometry_type = geometry.get("type")
 
-        if geometry.get("type") == "Polygon":
+        if geometry_type == "Polygon":
             coordinates = geometry.get("coordinates", [])
-
             if coordinates:
                 ring = coordinates[0]
-
-                # GeoJSON: [longitude, latitude]
                 coords = [
                     (lat_value, lon_value)
                     for lon_value, lat_value in ring
                 ]
-
-                area = folium_polygon_to_shapely(
-                    coords, to_xy
-                )
+                area = folium_polygon_to_shapely(coords, to_xy)
 
                 if area is not None:
-                    usable_area = area.buffer(
-                        -float(boundary_margin)
-                    )
+                    usable_area = area.buffer(-float(boundary_margin))
 
                     if usable_area.is_empty:
                         st.warning(
-                            "Området blev för litet efter "
-                            "säkerhetsmarginalen."
+                            "Området blev för litet efter säkerhetsmarginalen."
                         )
                     else:
                         new_key = (
@@ -976,10 +1063,7 @@ if map_data:
                             round(area.centroid.y, 1),
                         )
 
-                        if (
-                            st.session_state.drawn_area_key
-                            != new_key
-                        ):
+                        if st.session_state.get("drawn_area_key") != new_key:
                             st.session_state.osm_layers = None
                             st.session_state.osm_area_key = None
                             st.session_state.candidates = None
@@ -987,6 +1071,31 @@ if map_data:
                         st.session_state.drawn_area = usable_area
                         st.session_state.drawn_area_geojson = drawing
                         st.session_state.drawn_area_key = new_key
+
+        elif geometry_type == "Point":
+            coordinates = geometry.get("coordinates", [])
+            if len(coordinates) >= 2:
+                start_lon, start_lat = coordinates[:2]
+                sx, sy = to_xy.transform(start_lon, start_lat)
+                preferred_start = Point(sx, sy)
+
+                if (
+                    st.session_state.drawn_area is not None
+                    and st.session_state.drawn_area.covers(preferred_start)
+                ):
+                    old_start = st.session_state.get("preferred_start")
+                    changed = (
+                        old_start is None
+                        or old_start.distance(preferred_start) > 0.5
+                    )
+                    st.session_state.preferred_start = preferred_start
+                    st.session_state.preferred_start_geojson = drawing
+                    if changed:
+                        st.session_state.candidates = None
+                else:
+                    st.warning(
+                        "Startpunkten måste ligga inom det användbara området."
+                    )
 
 
 if st.session_state.drawn_area is not None:
@@ -997,6 +1106,21 @@ if st.session_state.drawn_area is not None:
         f"{area_ha:.1f} ha",
     )
 
+    if st.session_state.preferred_start is None:
+        st.caption(
+            "Valfri startpunkt: välj markörverktyget på kartan och placera en markör inom området."
+        )
+    else:
+        st.success("Önskad startpunkt vald.")
+        if st.button(
+            "📍 Rensa vald startpunkt",
+            use_container_width=True,
+        ):
+            st.session_state.preferred_start = None
+            st.session_state.preferred_start_geojson = None
+            st.session_state.candidates = None
+            st.rerun()
+
     if st.button(
         "🗑️ Rensa ritat område",
         use_container_width=True,
@@ -1004,6 +1128,8 @@ if st.session_state.drawn_area is not None:
         st.session_state.drawn_area = None
         st.session_state.drawn_area_geojson = None
         st.session_state.drawn_area_key = None
+        st.session_state.preferred_start = None
+        st.session_state.preferred_start_geojson = None
         st.session_state.osm_layers = None
         st.session_state.osm_area_key = None
         st.session_state.candidates = None
@@ -1082,6 +1208,13 @@ if (
         int(min_leg),
         int(max_leg),
         int(boundary_margin),
+        int(preferred_separation),
+        int(minimum_separation),
+        int(start_radius),
+        (
+            round(st.session_state.preferred_start.x, 1),
+            round(st.session_state.preferred_start.y, 1),
+        ) if st.session_state.preferred_start is not None else None,
         st.session_state.osm_area_key,
     )
 
@@ -1105,6 +1238,10 @@ if (
                 n_candidates=250,
                 min_leg=int(min_leg),
                 max_leg=int(max_leg),
+                preferred_start=st.session_state.preferred_start,
+                start_radius_m=float(start_radius),
+                preferred_separation_m=float(preferred_separation),
+                minimum_separation_m=float(minimum_separation),
             )
 
             selected = select_diverse_candidates(
@@ -1261,6 +1398,17 @@ if st.session_state.candidates:
     cols[3].metric(
         "Vinklar", str(int(num_angles))
     )
+
+    extra_cols = st.columns(2)
+    extra_cols[0].metric(
+        "Min. benavstånd",
+        f"{candidate.get('min_separation', 0.0):.0f} m",
+    )
+    if st.session_state.preferred_start is not None:
+        extra_cols[1].metric(
+            "Start från vald punkt",
+            f"{candidate.get('start_distance', 0.0):.0f} m",
+        )
 
     if objects:
         st.subheader("Objekt")
