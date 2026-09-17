@@ -9,6 +9,7 @@ from folium.plugins import Draw
 from pyproj import Transformer
 from shapely.geometry import Point, LineString, Polygon, MultiPolygon
 from shapely.ops import unary_union
+from shapely.prepared import prep
 from streamlit_folium import st_folium
 
 
@@ -189,12 +190,16 @@ def sample_point_in_area(area, rng, max_attempts=2000):
     return None
 
 
-def choose_start_point(area, rng, preferred_start=None, radius_m=35.0):
+def choose_start_point(
+    area, rng, preferred_start=None, radius_m=35.0, prepared_area=None
+):
     """Choose a start point, preferring the user's selected map position."""
     if preferred_start is None:
         return sample_point_in_area(area, rng)
 
-    if not area.covers(preferred_start):
+    area_covers = prepared_area.covers if prepared_area is not None else area.covers
+
+    if not area_covers(preferred_start):
         return None
 
     # Try positions near the selected point so generation is not forced to
@@ -206,25 +211,37 @@ def choose_start_point(area, rng, preferred_start=None, radius_m=35.0):
             preferred_start.x + distance * math.cos(angle),
             preferred_start.y + distance * math.sin(angle),
         )
-        if area.covers(point):
+        if area_covers(point):
             return point
 
     return preferred_start
 
 
-def segment_allowed(segment, area, hard_geometry=None):
-    """Require the complete segment to remain inside the usable area."""
-    if segment is None or segment.is_empty:
+def segment_allowed(
+    segment,
+    area,
+    hard_geometry=None,
+    prepared_area=None,
+    prepared_hard=None,
+):
+    """Fast staged test for polygon containment and mapped obstacles."""
+    if segment is None or segment.is_empty or area is None or area.is_empty:
         return False
 
-    if area is None or area.is_empty:
-        return False
-
-    if not area.covers(segment):
+    # Prepared geometries make the repeated covers/intersects predicates much
+    # cheaper during candidate generation. Fall back to ordinary predicates
+    # when no prepared geometry was supplied.
+    if prepared_area is not None:
+        if not prepared_area.covers(segment):
+            return False
+    elif not area.covers(segment):
         return False
 
     if hard_geometry is not None and not hard_geometry.is_empty:
-        if segment.intersects(hard_geometry):
+        if prepared_hard is not None:
+            if prepared_hard.intersects(segment):
+                return False
+        elif segment.intersects(hard_geometry):
             return False
 
     return True
@@ -237,26 +254,14 @@ def overpass_query(south, west, north, east):
     bbox = f"{south},{west},{north},{east}"
 
     query = f"""
-    [out:json][timeout:60];
+    [out:json][timeout:35];
     (
-      way["landuse"="forest"]({bbox});
-      way["natural"="wood"]({bbox});
-      way["natural"="scrub"]({bbox});
-      way["landuse"="meadow"]({bbox});
-      way["landuse"="grass"]({bbox});
-      way["landuse"="farmland"]({bbox});
-      way["landuse"="residential"]({bbox});
-      way["landuse"="industrial"]({bbox});
-      way["landuse"="commercial"]({bbox});
-      way["landuse"="quarry"]({bbox});
-      way["natural"="water"]({bbox});
-      way["waterway"="riverbank"]({bbox});
+      nwr["landuse"~"^(forest|meadow|grass|farmland|residential|industrial|commercial|quarry)$"]({bbox});
+      nwr["natural"~"^(wood|scrub|water)$"]({bbox});
+      nwr["waterway"="riverbank"]({bbox});
       way["highway"]({bbox});
-      way["building"]({bbox});
+      nwr["building"]({bbox});
       way["barrier"]({bbox});
-      relation["natural"="wood"]({bbox});
-      relation["landuse"="forest"]({bbox});
-      relation["natural"="water"]({bbox});
     );
     out geom;
     """
@@ -268,7 +273,7 @@ def overpass_query(south, west, north, east):
             response = requests.post(
                 endpoint,
                 data=query,
-                timeout=75,
+                timeout=42,
                 headers={"User-Agent": "SBK-Spårgenerator/1.0"},
             )
             response.raise_for_status()
@@ -386,13 +391,17 @@ def build_osm_layers(data, to_xy):
         road_union,
         barrier_union,
     ])
+    if not hard_union.is_empty:
+        hard_union = hard_union.simplify(0.35, preserve_topology=True)
 
     return {
         "forest": forest_union,
         "soft": soft_union,
         "water": water_union,
         "roads": road_union,
-        "paths": unary_union(paths) if paths else Polygon(),
+        # Paths are not used by the current generator, so avoid an expensive
+        # unary_union here.
+        "paths": Polygon(),
         "barriers": barrier_union,
         "hard": hard_union,
     }
@@ -471,13 +480,19 @@ def generate_candidate(
     exit_clearance_m=25.0,
     start_clearance_m=40.0,
     appell_mode=False,
+    prepared_area=None,
+    prepared_hard=None,
 ):
     """Generate an open, non-self-intersecting track with clear access."""
     if area is None or area.is_empty:
         return None
 
     start = choose_start_point(
-        area, rng, preferred_start=preferred_start, radius_m=start_radius_m
+        area,
+        rng,
+        preferred_start=preferred_start,
+        radius_m=start_radius_m,
+        prepared_area=prepared_area,
     )
     if start is None:
         return None
@@ -501,7 +516,7 @@ def generate_candidate(
     for leg_length in leg_lengths:
         accepted = False
 
-        for _ in range(110):
+        for _ in range(80):
             proposed_turn = None
             if previous_heading is None:
                 heading = float(rng.uniform(0.0, 360.0))
@@ -592,12 +607,34 @@ def generate_candidate(
                 (candidate_point.x, candidate_point.y),
             ])
 
-            if not segment_allowed(segment, area, hard_geometry):
+            if not segment_allowed(
+                segment,
+                area,
+                hard_geometry,
+                prepared_area=prepared_area,
+                prepared_hard=prepared_hard,
+            ):
                 continue
 
             non_adjacent_segments = accepted_segments[:-1]
 
-            if any(segment.intersects(old) for old in non_adjacent_segments):
+            # Cheap bounding-box rejection before exact GEOS predicates. Most
+            # older legs are nowhere near a proposed segment, especially on
+            # long Högre/Elit tracks.
+            sx0, sy0, sx1, sy1 = segment.bounds
+            nearby_segments = []
+            margin = float(minimum_separation_m)
+            for old in non_adjacent_segments:
+                ox0, oy0, ox1, oy1 = old.bounds
+                if not (
+                    sx1 + margin < ox0
+                    or ox1 + margin < sx0
+                    or sy1 + margin < oy0
+                    or oy1 + margin < sy0
+                ):
+                    nearby_segments.append(old)
+
+            if any(segment.intersects(old) for old in nearby_segments):
                 continue
 
             # After the first two legs, do not let the track return close to
@@ -607,9 +644,24 @@ def generate_candidate(
                 if segment.intersects(start_zone):
                     continue
 
-            distances = [
-                segment.distance(old) for old in non_adjacent_segments
-            ]
+            # Exact distance is only useful for legs close enough to affect
+            # either the hard floor or the preferred-separation score.
+            score_margin = max(
+                float(minimum_separation_m),
+                float(preferred_separation_m),
+            )
+            distance_candidates = []
+            for old in non_adjacent_segments:
+                ox0, oy0, ox1, oy1 = old.bounds
+                if not (
+                    sx1 + score_margin < ox0
+                    or ox1 + score_margin < sx0
+                    or sy1 + score_margin < oy0
+                    or oy1 + score_margin < sy0
+                ):
+                    distance_candidates.append(old)
+
+            distances = [segment.distance(old) for old in distance_candidates]
             closest = min(distances) if distances else float("inf")
 
             # Absolute floor: never accept legs closer than this.
@@ -644,7 +696,10 @@ def generate_candidate(
     if not area.covers(track):
         return None
     if hard_geometry is not None and not hard_geometry.is_empty:
-        if track.intersects(hard_geometry):
+        if prepared_hard is not None:
+            if prepared_hard.intersects(track):
+                return None
+        elif track.intersects(hard_geometry):
             return None
     if not track.is_simple:
         return None
@@ -677,7 +732,10 @@ def generate_candidate(
         # The exit route may leave the selected polygon, but it must not pass
         # through mapped hard obstacles.
         if hard_geometry is not None and not hard_geometry.is_empty:
-            if exit_segment.intersects(hard_geometry):
+            if prepared_hard is not None:
+                if prepared_hard.intersects(exit_segment):
+                    return None
+            elif exit_segment.intersects(hard_geometry):
                 return None
 
         # Ignore the final track leg because the exit route necessarily starts
@@ -797,6 +855,15 @@ def generate_best(
     rng = np.random.default_rng(seed)
     scored = []
 
+    # These geometries are queried hundreds/thousands of times per generation.
+    # Preparing them once builds an internal spatial index for fast predicates.
+    prepared_area = prep(area) if area is not None and not area.is_empty else None
+    prepared_hard = (
+        prep(hard_geometry)
+        if hard_geometry is not None and not hard_geometry.is_empty
+        else None
+    )
+
     for _ in range(n_candidates):
         candidate = generate_candidate(
             area=area,
@@ -817,6 +884,8 @@ def generate_best(
             exit_clearance_m=exit_clearance_m,
             start_clearance_m=start_clearance_m,
             appell_mode=appell_mode,
+            prepared_area=prepared_area,
+            prepared_hard=prepared_hard,
         )
 
         if candidate is None:
@@ -1742,8 +1811,13 @@ if st.session_state.drawn_area is not None:
                 or st.session_state.osm_area_key != area_key
             ):
                 with st.spinner("Hämtar kartdata och analyserar området..."):
+                    # Round to ~1 m. Tiny projection/float differences
+                    # should not cause a new Overpass request.
                     data = overpass_query(
-                        south, west, north, east
+                        round(south, 5),
+                        round(west, 5),
+                        round(north, 5),
+                        round(east, 5),
                     )
                     st.session_state.osm_layers = build_osm_layers(
                         data, to_xy
@@ -1766,9 +1840,9 @@ if st.session_state.drawn_area is not None:
                     num_objects=int(num_objects),
                     seed=int(seed),
                     n_candidates=(
-                        140 if int(num_angles) <= 2
-                        else 190 if int(num_angles) <= 5
-                        else 230
+                        90 if int(num_angles) <= 2
+                        else 140 if int(num_angles) <= 5
+                        else 180
                     ),
                     min_leg=int(min_leg),
                     max_leg=int(max_leg),
