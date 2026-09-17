@@ -24,6 +24,7 @@ CACHE_TTL = 900
 MAX_TURN_DEG = 90.0
 DEFAULT_PREFERRED_LEG_SEPARATION_M = 25.0
 DEFAULT_MIN_LEG_SEPARATION_M = 12.0
+DEFAULT_EXIT_CLEARANCE_M = 25.0
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -71,6 +72,8 @@ for key, value in {
     "drawn_area_key": None,
     "preferred_start": None,
     "preferred_start_geojson": None,
+    "preferred_exit": None,
+    "preferred_exit_geojson": None,
     "osm_layers": None,
     "osm_area_key": None,
     "osm_count": 0,
@@ -415,8 +418,10 @@ def generate_candidate(
     max_leg=100,
     preferred_start=None,
     start_radius_m=35.0,
+    preferred_exit=None,
     preferred_separation_m=25.0,
     minimum_separation_m=12.0,
+    exit_clearance_m=25.0,
 ):
     """Generate a simple track with a preferred leg separation."""
     if area is None or area.is_empty:
@@ -509,6 +514,36 @@ def generate_candidate(
         if preferred_start is not None else 0.0
     )
 
+    exit_distance = 0.0
+    exit_clearance = float("inf")
+    exit_segment = None
+
+    if preferred_exit is not None:
+        end_point = Point(track.coords[-1])
+        exit_distance = end_point.distance(preferred_exit)
+        exit_segment = LineString([
+            (end_point.x, end_point.y),
+            (preferred_exit.x, preferred_exit.y),
+        ])
+
+        # The exit route may leave the selected polygon, but it must not pass
+        # through mapped hard obstacles.
+        if hard_geometry is not None and not hard_geometry.is_empty:
+            if exit_segment.intersects(hard_geometry):
+                return None
+
+        # Ignore the final track leg because the exit route necessarily starts
+        # at its endpoint. Keep the walking route clear of all earlier legs.
+        earlier_legs = accepted_segments[:-1]
+        if earlier_legs:
+            exit_clearance = min(
+                exit_segment.distance(old) for old in earlier_legs
+            )
+            if exit_clearance < minimum_separation_m:
+                return None
+        else:
+            exit_clearance = exit_clearance_m
+
     return {
         "geometry": track,
         "length": track.length,
@@ -516,6 +551,10 @@ def generate_candidate(
         "min_separation": float(minimum_observed_separation),
         "preferred_separation": float(preferred_separation_m),
         "start_distance": float(start_distance),
+        "exit_distance": float(exit_distance),
+        "exit_clearance": float(exit_clearance),
+        "exit_segment": exit_segment,
+        "preferred_exit_clearance": float(exit_clearance_m),
     }
 
 
@@ -544,11 +583,29 @@ def candidate_score(candidate, forest, soft):
     # Prefer candidates starting close to the user's chosen point.
     start_penalty = min(candidate.get("start_distance", 0.0), 100.0) * 0.35
 
+    # If an exit point is selected, strongly prefer ending close to it and
+    # having a clear walking corridor from track end to that point.
+    exit_distance_penalty = min(
+        candidate.get("exit_distance", 0.0), 250.0
+    ) * 0.45
+
+    preferred_exit_clearance = max(
+        candidate.get("preferred_exit_clearance", 25.0), 1.0
+    )
+    exit_clearance = candidate.get(
+        "exit_clearance", preferred_exit_clearance
+    )
+    exit_clearance_bonus = min(
+        exit_clearance / preferred_exit_clearance, 1.0
+    ) * 35.0
+
     return (
         forest_length / track.length * 100.0
         + soft_length / track.length * 35.0
         + separation_bonus
+        + exit_clearance_bonus
         - start_penalty
+        - exit_distance_penalty
     )
 
 
@@ -566,8 +623,10 @@ def generate_best(
     max_leg=100,
     preferred_start=None,
     start_radius_m=35.0,
+    preferred_exit=None,
     preferred_separation_m=25.0,
     minimum_separation_m=12.0,
+    exit_clearance_m=25.0,
 ):
     rng = np.random.default_rng(seed)
     scored = []
@@ -586,8 +645,10 @@ def generate_best(
             max_leg=max_leg,
             preferred_start=preferred_start,
             start_radius_m=start_radius_m,
+            preferred_exit=preferred_exit,
             preferred_separation_m=preferred_separation_m,
             minimum_separation_m=minimum_separation_m,
+            exit_clearance_m=exit_clearance_m,
         )
 
         if candidate is None:
@@ -863,6 +924,8 @@ with st.expander("📍 Plats", expanded=True):
                 st.session_state.drawn_area_key = None
                 st.session_state.preferred_start = None
                 st.session_state.preferred_start_geojson = None
+                st.session_state.preferred_exit = None
+                st.session_state.preferred_exit_geojson = None
                 st.session_state.osm_layers = None
                 st.session_state.osm_area_key = None
                 st.session_state.candidates = None
@@ -969,6 +1032,18 @@ with st.expander("⚙️ Spårinställningar", expanded=True):
             help="Spåret försöker starta nära vald punkt inom denna radie.",
         )
 
+        exit_clearance = st.number_input(
+            "Önskat fritt avstånd vid utgång (m)",
+            min_value=10,
+            max_value=100,
+            value=int(DEFAULT_EXIT_CLEARANCE_M),
+            step=5,
+            help=(
+                "Generatorn premierar en utgångsväg som håller minst detta "
+                "avstånd till tidigare spårben."
+            ),
+        )
+
         seed = st.number_input(
             "Slumpfrö",
             min_value=0,
@@ -987,6 +1062,16 @@ if st.session_state.location is None:
 
 lat, lon = st.session_state.location
 to_xy, to_ll = transformers(lat, lon)
+
+point_selection_mode = st.radio(
+    "Markörverktyget placerar",
+    ["Startpunkt", "Utgångspunkt"],
+    horizontal=True,
+    help=(
+        "Välj vad nästa markör på kartan ska betyda. "
+        "Utgångspunkten får ligga utanför det ritade området."
+    ),
+)
 
 m = folium.Map(
     location=[lat, lon],
@@ -1021,6 +1106,18 @@ if st.session_state.preferred_start is not None:
         [start_lat, start_lon],
         tooltip="Önskad startpunkt",
         icon=folium.Icon(color="green", icon="play"),
+    ).add_to(m)
+
+if st.session_state.preferred_exit is not None:
+    exit_lat, exit_lon = xy_ll(
+        st.session_state.preferred_exit.x,
+        st.session_state.preferred_exit.y,
+        to_ll,
+    )
+    folium.Marker(
+        [exit_lat, exit_lon],
+        tooltip="Önskad utgångspunkt",
+        icon=folium.Icon(color="red", icon="sign-out"),
     ).add_to(m)
 
 Draw(
@@ -1093,27 +1190,39 @@ if map_data:
         elif geometry_type == "Point":
             coordinates = geometry.get("coordinates", [])
             if len(coordinates) >= 2:
-                start_lon, start_lat = coordinates[:2]
-                sx, sy = to_xy.transform(start_lon, start_lat)
-                preferred_start = Point(sx, sy)
+                point_lon, point_lat = coordinates[:2]
+                px, py = to_xy.transform(point_lon, point_lat)
+                selected_point = Point(px, py)
 
-                if (
-                    st.session_state.drawn_area is not None
-                    and st.session_state.drawn_area.covers(preferred_start)
-                ):
-                    old_start = st.session_state.get("preferred_start")
+                if point_selection_mode == "Startpunkt":
+                    if (
+                        st.session_state.drawn_area is not None
+                        and st.session_state.drawn_area.covers(selected_point)
+                    ):
+                        old_start = st.session_state.get("preferred_start")
+                        changed = (
+                            old_start is None
+                            or old_start.distance(selected_point) > 0.5
+                        )
+                        st.session_state.preferred_start = selected_point
+                        st.session_state.preferred_start_geojson = drawing
+                        if changed:
+                            st.session_state.candidates = None
+                    else:
+                        st.warning(
+                            "Startpunkten måste ligga inom det användbara området."
+                        )
+                else:
+                    old_exit = st.session_state.get("preferred_exit")
                     changed = (
-                        old_start is None
-                        or old_start.distance(preferred_start) > 0.5
+                        old_exit is None
+                        or old_exit.distance(selected_point) > 0.5
                     )
-                    st.session_state.preferred_start = preferred_start
-                    st.session_state.preferred_start_geojson = drawing
+                    # The exit point may deliberately be outside the polygon.
+                    st.session_state.preferred_exit = selected_point
+                    st.session_state.preferred_exit_geojson = drawing
                     if changed:
                         st.session_state.candidates = None
-                else:
-                    st.warning(
-                        "Startpunkten måste ligga inom det användbara området."
-                    )
 
 
 if st.session_state.drawn_area is not None:
@@ -1139,6 +1248,22 @@ if st.session_state.drawn_area is not None:
             st.session_state.candidates = None
             st.rerun()
 
+    if st.session_state.preferred_exit is None:
+        st.caption(
+            "Valfri utgångspunkt: välj 'Utgångspunkt' ovan och placera "
+            "en markör där du vill lämna området."
+        )
+    else:
+        st.success("Önskad utgångspunkt vald.")
+        if st.button(
+            "🚶 Rensa vald utgångspunkt",
+            use_container_width=True,
+        ):
+            st.session_state.preferred_exit = None
+            st.session_state.preferred_exit_geojson = None
+            st.session_state.candidates = None
+            st.rerun()
+
     if st.button(
         "🗑️ Rensa ritat område",
         use_container_width=True,
@@ -1148,6 +1273,8 @@ if st.session_state.drawn_area is not None:
         st.session_state.drawn_area_key = None
         st.session_state.preferred_start = None
         st.session_state.preferred_start_geojson = None
+        st.session_state.preferred_exit = None
+        st.session_state.preferred_exit_geojson = None
         st.session_state.osm_layers = None
         st.session_state.osm_area_key = None
         st.session_state.candidates = None
@@ -1190,10 +1317,15 @@ if st.session_state.drawn_area is not None:
         int(preferred_separation),
         int(minimum_separation),
         int(start_radius),
+        int(exit_clearance),
         (
             round(st.session_state.preferred_start.x, 1),
             round(st.session_state.preferred_start.y, 1),
         ) if st.session_state.preferred_start is not None else None,
+        (
+            round(st.session_state.preferred_exit.x, 1),
+            round(st.session_state.preferred_exit.y, 1),
+        ) if st.session_state.preferred_exit is not None else None,
         area_key,
     )
 
@@ -1239,8 +1371,10 @@ if st.session_state.drawn_area is not None:
                     max_leg=int(max_leg),
                     preferred_start=st.session_state.preferred_start,
                     start_radius_m=float(start_radius),
+                    preferred_exit=st.session_state.preferred_exit,
                     preferred_separation_m=float(preferred_separation),
                     minimum_separation_m=float(minimum_separation),
+                    exit_clearance_m=float(exit_clearance),
                 )
 
                 selected = select_diverse_candidates(
@@ -1355,6 +1489,23 @@ if st.session_state.candidates:
         track_map, candidate, to_ll, objects
     )
 
+    if candidate.get("exit_segment") is not None:
+        exit_locations = [
+            xy_ll(x, y, to_ll)
+            for x, y in candidate["exit_segment"].coords
+        ]
+        folium.PolyLine(
+            locations=exit_locations,
+            tooltip="Föreslagen utgångsväg",
+            weight=4,
+            dash_array="8, 8",
+        ).add_to(track_map)
+        folium.Marker(
+            exit_locations[-1],
+            tooltip="Utgångspunkt",
+            icon=folium.Icon(color="red", icon="sign-out"),
+        ).add_to(track_map)
+
     st_folium(
         track_map,
         width=None,
@@ -1413,6 +1564,17 @@ if st.session_state.candidates:
         extra_cols[1].metric(
             "Start från vald punkt",
             f"{candidate.get('start_distance', 0.0):.0f} m",
+        )
+
+    if st.session_state.preferred_exit is not None:
+        exit_cols = st.columns(2)
+        exit_cols[0].metric(
+            "Slut till utgångspunkt",
+            f"{candidate.get('exit_distance', 0.0):.0f} m",
+        )
+        exit_cols[1].metric(
+            "Min. avstånd på utgångsväg",
+            f"{candidate.get('exit_clearance', 0.0):.0f} m",
         )
 
     if objects:
